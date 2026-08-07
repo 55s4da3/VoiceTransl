@@ -990,7 +990,10 @@ class MainWindow(QMainWindow):
         clip_times.addWidget(self.clip_end_time, 1, 1)
         clip_inputs.addLayout(clip_times)
         clip_row.addWidget(clip_panel, 1)
-        clip_row.addWidget(self._action_column(self.run_clip_button))
+        clip_row.addWidget(self._action_column(
+            self.run_clip_button,
+            self.clip_cancel_button,
+        ))
         self.clip_layout.addLayout(clip_row)
 
         separator = QFrame(self.clip_tab)
@@ -1006,12 +1009,15 @@ class MainWindow(QMainWindow):
         uvr_model_row = QHBoxLayout()
         uvr_model_row.addWidget(self.clip_uvr_model_label)
         uvr_model_row.addWidget(self.uvr_file)
-        uvr_model_row.addWidget(self.open_uvr_dir)
         uvr_model_row.addStretch()
         vocal_inputs.addLayout(uvr_model_row)
         vocal_inputs.addWidget(self.uvr_file_list)
         vocal_row.addWidget(vocal_panel, 1)
-        vocal_row.addWidget(self._action_column(self.run_uvr_button))
+        vocal_row.addWidget(self._action_column(
+            self.run_uvr_button,
+            self.uvr_cancel_button,
+            self.open_uvr_dir,
+        ))
         self.clip_layout.addLayout(vocal_row)
 
         self._clear_layout(self.synth_layout)
@@ -1037,6 +1043,7 @@ class MainWindow(QMainWindow):
             self.synth_video_browse_btn,
             self.synth_srt_browse_btn,
             self.run_synth_button,
+            self.synth_cancel_button,
         ))
         self.synth_layout.addLayout(video_row)
 
@@ -1052,7 +1059,10 @@ class MainWindow(QMainWindow):
         audio_inputs.addWidget(self.synth_audio_label)
         audio_inputs.addWidget(self.synth_audio_files_list)
         audio_row.addWidget(audio_panel, 1)
-        audio_row.addWidget(self._action_column(self.run_synth_audio_button))
+        audio_row.addWidget(self._action_column(
+            self.run_synth_audio_button,
+            self.synth_audio_cancel_button,
+        ))
         self.synth_layout.addLayout(audio_row)
 
         self._clear_layout(self.summarize_layout)
@@ -1066,7 +1076,10 @@ class MainWindow(QMainWindow):
         summarize_inputs.addWidget(self.summarize_input_label)
         summarize_inputs.addWidget(self.summarize_files_list)
         summarize_row.addWidget(summarize_panel, 1)
-        summarize_row.addWidget(self._action_column(self.run_summarize_button))
+        summarize_row.addWidget(self._action_column(
+            self.run_summarize_button,
+            self.summarize_cancel_button,
+        ))
         self.summarize_layout.addLayout(summarize_row)
 
     def _build_tools_page(self):
@@ -2162,6 +2175,9 @@ class MainWindow(QMainWindow):
         self.run_clip_button = QPushButton(_("clip_run_btn"))
         self.run_clip_button.clicked.connect(self.run_clip)
         self.clip_layout.addWidget(self.run_clip_button)
+        self.clip_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.clip_cancel_button.clicked.connect(self.cancel_task)
+        self.clip_layout.addWidget(self.clip_cancel_button)
 
         # Vocal Split
         self.clip_vocal_split_label = BodyLabel(_("clip_vocal_split_label"))
@@ -2175,9 +2191,6 @@ class MainWindow(QMainWindow):
         self.uvr_file.addItems(uvr_lst)
         self.uvr_file.setToolTip(_("tip_clip_uvr_model"))
         uvr_model_row.addWidget(self.uvr_file)
-        self.open_uvr_dir = QPushButton(_("clip_open_uvr_btn"))
-        self.open_uvr_dir.clicked.connect(lambda: open_path(os.path.join(os.getcwd(), 'separate')))
-        uvr_model_row.addWidget(self.open_uvr_dir)
         uvr_model_row.addStretch()
         self.clip_layout.addLayout(uvr_model_row)
         self.uvr_file_list = QTextEdit()
@@ -2189,6 +2202,11 @@ class MainWindow(QMainWindow):
         self.run_uvr_button = QPushButton(_("clip_vocal_run_btn"))
         self.run_uvr_button.clicked.connect(self.run_vocal_split)
         self.clip_layout.addWidget(self.run_uvr_button)
+        self.uvr_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.uvr_cancel_button.clicked.connect(self.cancel_task)
+        self.clip_layout.addWidget(self.uvr_cancel_button)
+        self.open_uvr_dir = QPushButton(_("clip_open_uvr_btn"))
+        self.open_uvr_dir.clicked.connect(lambda: open_path(os.path.join(os.getcwd(), 'separate')))
 
     def initSynthTab(self):
         self.synth_tab = Widget("Synth", self)
@@ -2249,6 +2267,9 @@ class MainWindow(QMainWindow):
         self.run_synth_button = QPushButton(_("synth_run_btn"))
         self.run_synth_button.clicked.connect(self.run_synth)
         hbox.addWidget(self.run_synth_button)
+        self.synth_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.synth_cancel_button.clicked.connect(self.cancel_task)
+        hbox.addWidget(self.synth_cancel_button)
         self.synth_layout.addLayout(hbox)
 
         # Audio Synth
@@ -2262,6 +2283,9 @@ class MainWindow(QMainWindow):
         self.run_synth_audio_button = QPushButton(_("synth_audio_run_btn"))
         self.run_synth_audio_button.clicked.connect(self.run_synth_audio)
         self.synth_layout.addWidget(self.run_synth_audio_button)
+        self.synth_audio_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.synth_audio_cancel_button.clicked.connect(self.cancel_task)
+        self.synth_layout.addWidget(self.synth_audio_cancel_button)
 
     def initSummarizeTab(self):
         self.summarize_tab = Widget("Summarize", self)
@@ -2284,6 +2308,9 @@ class MainWindow(QMainWindow):
         self.run_summarize_button = QPushButton(_("summarize_run_btn"))
         self.run_summarize_button.clicked.connect(self.run_summarize)
         self.summarize_layout.addWidget(self.run_summarize_button)
+        self.summarize_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.summarize_cancel_button.clicked.connect(self.cancel_task)
+        self.summarize_layout.addWidget(self.summarize_cancel_button)
 
     def run_worker(self):
         self._start_worker_task('run', _("task_workflow"))
