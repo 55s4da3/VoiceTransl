@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+qt_material_datas = collect_data_files('qt_material')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('icon.png', '.'), ('llama', 'llama'), ('crispasr', 'crispasr'), ('project', 'project'), ('separate', 'separate'), ('plugins', 'plugins'), ('ffmpeg', 'ffmpeg'), ('translate', 'translate'), ('translation_guidelines','translation_guidelines')],
+    datas=[('icon.png', '.'), ('avatar.png', '.'), ('llama', 'llama'), ('crispasr', 'crispasr'), ('project', 'project'), ('separate', 'separate'), ('plugins', 'plugins'), ('ffmpeg', 'ffmpeg'), ('translate', 'translate'), ('translation_guidelines','translation_guidelines')] + qt_material_datas,
     hiddenimports=['tiktoken_ext.openai_public', 'tiktoken_ext'],
     hookspath=[],
     hooksconfig={},

@@ -34,11 +34,16 @@ def _resolve_ffmpeg() -> tuple[str, str]:
 
 _FFMPEG, _FFPROBE = _resolve_ffmpeg()
 from i18n import _, set_language, get_language
-from PyQt5 import QtGui, QtCore
-from PyQt5.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer, QDateTime, QSize
-from PyQt5.QtWidgets import QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu, QAction, QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget
-from qfluentwidgets import PushButton as QPushButton, TextEdit as QTextEdit, LineEdit as QLineEdit, ComboBox as QComboBox, Slider as QSlider, FluentWindow as QMainWindow, PlainTextEdit as QPlainTextEdit, SplashScreen, SpinBox as QSpinBox
-from qfluentwidgets import FluentIcon, NavigationItemPosition, SubtitleLabel, TitleLabel, BodyLabel
+from PySide6 import QtGui, QtCore
+from PySide6.QtCore import QThread, QObject, Signal, QTimer
+from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu,
+    QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget, QGridLayout,
+    QScrollArea, QProgressBar, QSizePolicy, QMainWindow, QTabWidget,
+    QPushButton, QTextEdit, QLineEdit, QComboBox, QPlainTextEdit, QSpinBox,
+)
+from qt_material import apply_stylesheet
 
 import re
 import asyncio
@@ -61,7 +66,58 @@ from bilibili_dl.bilibili_dl.constants import URL_VIDEO_INFO
 from pathlib import Path
 
 
+DEFAULT_UI_THEME = 'light_blue.xml'
+DICTIONARY_PRESET_DIR = Path('project') / 'dictionary_presets'
+UI_THEME_OPTIONS = (
+    ('theme_light_blue', 'light_blue.xml'),
+    ('theme_light_teal', 'light_teal.xml'),
+    ('theme_light_purple', 'light_purple.xml'),
+    ('theme_dark_blue', 'dark_blue.xml'),
+    ('theme_dark_teal', 'dark_teal.xml'),
+    ('theme_dark_purple', 'dark_purple.xml'),
+)
+
+MATERIAL_OVERRIDES = """
+QWidget {
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+}
+QPushButton {
+    text-transform: none;
+    font-weight: 600;
+    border-radius: 6px;
+    min-height: 28px;
+}
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {
+    border-radius: 6px;
+}
+QTabBar::tab {
+    text-transform: none;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QProgressBar {
+    border-radius: 3px;
+}
+QToolTip {
+    padding: 6px;
+    border-radius: 4px;
+}
+"""
+
+
 NO_TRANSCRIPTION = '不进行听写'
+NO_TRANSLATION = '不进行翻译'
+DEFAULT_CRISPASR_BACKEND = 'qwen3-1.7b'
+CRISPASR_BACKEND_FALLBACK = (
+    'whisper', 'parakeet', 'canary', 'cohere', 'qwen3',
+    'qwen3-1.7b', 'mega-asr', 'voxtral', 'voxtral4b', 'granite',
+)
+
+
+def _compose_output_format(content, container, translation_enabled):
+    content = content if content in ('双语', '目标') else '双语'
+    container = container if container in ('SRT', 'LRC') else 'SRT'
+    return f"{content if translation_enabled else '原文'}{container}"
 
 
 def _list_crispasr_models():
@@ -74,6 +130,55 @@ def _list_crispasr_models():
     )
 
 
+def _list_crispasr_aligners():
+    model_dir = Path('crispasr')
+    if not model_dir.is_dir():
+        return []
+    return sorted(
+        path.name for path in model_dir.glob('*.gguf')
+        if 'aligner' in path.name.lower() or 'alignment' in path.name.lower()
+    )
+
+
+def _list_crispasr_backends():
+    """Return speech-recognition backends compiled into the local executable."""
+    crispasr_dir = Path('crispasr').resolve()
+    executable_name = 'crispasr.exe' if os.name == 'nt' else 'crispasr'
+    executable = crispasr_dir / executable_name
+    if not executable.is_file():
+        return list(CRISPASR_BACKEND_FALLBACK)
+
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    try:
+        result = subprocess.run(
+            [str(executable), '--list-backends-json'],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=10,
+            creationflags=creationflags,
+            check=False,
+        )
+        backend_data = json.loads(result.stdout)
+        speech_caps = {
+            'timestamps-native', 'timestamps-ctc', 'word-timestamps',
+            'language-detect',
+        }
+        task_only_caps = {'piano', 'separate', 'pitch', 'chords', 'tab', 'beats'}
+        backends = []
+        for item in backend_data.get('backends', []):
+            name = item.get('name', '').strip()
+            caps = set(item.get('caps', []))
+            if name and caps.intersection(speech_caps) and not caps.intersection(task_only_caps):
+                backends.append(name)
+        if backends:
+            return list(dict.fromkeys(backends))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        pass
+    return list(CRISPASR_BACKEND_FALLBACK)
+
+
 def _split_command_template(value):
     if os.name != 'nt':
         return shlex.split(value)
@@ -84,24 +189,33 @@ def _split_command_template(value):
     ]
 
 
-def _build_crispasr_command(input_file, output_file, model_file, language, param_crispasr):
+def _build_crispasr_command(
+    input_file, output_file, model_file, language, param_crispasr,
+    aligner_file=None, backend=None,
+):
     """按 param.txt 模板替换占位符，生成与旧 Whisper 相同风格的启动参数。"""
     crispasr_dir = Path('crispasr').resolve()
     executable_name = 'crispasr.exe' if os.name == 'nt' else 'crispasr'
     executable = crispasr_dir / executable_name
-    aligners = sorted(crispasr_dir.glob('*aligner*.gguf'))
+    aligners = _list_crispasr_aligners()
     if not executable.is_file():
         raise FileNotFoundError(f'CrispASR executable not found: {executable}')
-    if not aligners:
+    if not aligner_file and not aligners:
         raise FileNotFoundError(f'CrispASR aligner model not found in: {crispasr_dir}')
 
     model_path = Path(model_file)
     if not model_path.is_absolute():
         model_path = crispasr_dir / model_path
+    aligner_path = Path(aligner_file or aligners[0])
+    if not aligner_path.is_absolute():
+        aligner_path = crispasr_dir / aligner_path
+    if not aligner_path.is_file():
+        raise FileNotFoundError(f'CrispASR aligner model not found: {aligner_path}')
     replacements = {
         '$crispasr_executable': str(executable),
+        '$backend': backend or DEFAULT_CRISPASR_BACKEND,
         '$model_file': str(model_path.resolve()),
-        '$aligner_file': str(aligners[0].resolve()),
+        '$aligner_file': str(aligner_path.resolve()),
         '$language': language or 'auto',
         '$output_file': str(Path(output_file).resolve()),
         '$input_file': str(Path(input_file).resolve()),
@@ -113,6 +227,16 @@ def _build_crispasr_command(input_file, output_file, model_file, language, param
         command[index] = token
     if not command:
         raise ValueError('CrispASR param.txt is empty')
+    if backend:
+        for index, token in enumerate(command):
+            if token == '--backend' and index + 1 < len(command):
+                command[index + 1] = backend
+                break
+            if token.startswith('--backend='):
+                command[index] = f'--backend={backend}'
+                break
+        else:
+            command.extend(['--backend', backend])
     return command
 
 
@@ -144,7 +268,6 @@ ONLINE_TRANSLATOR_MAPPING = {
 }
 
 TRANSLATOR_SUPPORTED = [
-    '不进行翻译',
     "custom（自定义模型）",
     "sakura（日语本地模型）",
 ] + list(ONLINE_TRANSLATOR_MAPPING.keys())
@@ -581,7 +704,8 @@ class ConcurrentTranslationPool:
             make_srt(gt_output_json, zh_srt_output)
 
         if output_format in ('目标LRC', '双语LRC'):
-            lrc_output = os.path.join(output_dir, base_name + '.lrc')
+            lrc_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+            lrc_output = os.path.join(output_dir, base_name + lrc_suffix)
             make_lrc(gt_output_json, lrc_output)
 
         if output_format == '双语SRT':
@@ -895,6 +1019,61 @@ class ConcurrentTranslationPool:
             return None, None
 
 
+class BodyLabel(QLabel):
+    """Native Qt replacement for the former Fluent body label."""
+
+
+class SubtitleLabel(QLabel):
+    """Small section heading implemented with a native QLabel."""
+
+    def __init__(self, text: str = '', parent=None):
+        super().__init__(text, parent)
+        font = self.font()
+        font.setPointSize(max(font.pointSize() + 2, 11))
+        font.setBold(True)
+        self.setFont(font)
+
+
+class TitleLabel(QLabel):
+    """Page heading implemented with a native QLabel."""
+
+    def __init__(self, text: str = '', parent=None):
+        super().__init__(text, parent)
+        font = self.font()
+        font.setPointSize(max(font.pointSize() + 6, 16))
+        font.setBold(True)
+        self.setFont(font)
+
+
+class ScaledPixmapLabel(QLabel):
+    """Full-width label that scales a pixmap to fit the widget width."""
+
+    def __init__(self, pixmap=None, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = pixmap
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumHeight(100)
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = pixmap
+        self._update_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_pixmap()
+
+    def _update_pixmap(self):
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return
+        width = max(self.width(), 1)
+        scaled = self._source_pixmap.scaled(
+            width, self.height(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        super().setPixmap(scaled)
+
+
 class Widget(QFrame):
 
     def __init__(self, text: str, parent=None):
@@ -924,8 +1103,43 @@ def _save_api_key(api_key: str) -> None:
         f.write(f'VOICETRANSL_API_KEY={api_key}\n')
 
 
+def _load_ui_theme() -> str:
+    try:
+        if os.path.exists('gui_settings.yaml'):
+            with open('gui_settings.yaml', 'r', encoding='utf-8') as f:
+                saved_theme = (yaml.safe_load(f) or {}).get('ui_theme')
+            available = {theme for _label, theme in UI_THEME_OPTIONS}
+            if saved_theme in available:
+                return saved_theme
+    except Exception:
+        pass
+    return DEFAULT_UI_THEME
+
+
+def apply_material_theme(application: QApplication, theme: str) -> None:
+    """Apply a compact Material theme plus app-specific readability tweaks."""
+    available = {value for _label, value in UI_THEME_OPTIONS}
+    selected = theme if theme in available else DEFAULT_UI_THEME
+    apply_stylesheet(
+        application,
+        theme=selected,
+        invert_secondary=selected.startswith('light_'),
+        extra={
+            'density_scale': '-2',
+            'font_family': (
+                'Microsoft YaHei UI' if os.name == 'nt' else 'Noto Sans'
+            ),
+            'danger': '#d32f2f',
+            'warning': '#ed6c02',
+            'success': '#2e7d32',
+        },
+    )
+    application.setStyleSheet(application.styleSheet() + MATERIAL_OVERRIDES)
+    application.setProperty('ui_material_theme', selected)
+
+
 class MainWindow(QMainWindow):
-    status = pyqtSignal(str)
+    status = Signal(str)
 
     @staticmethod
     def default_output_dir() -> str:
@@ -933,9 +1147,15 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        application = QApplication.instance()
+        saved_theme = _load_ui_theme()
+        if application and application.property('ui_material_theme') != saved_theme:
+            apply_material_theme(application, saved_theme)
         self.msg_queue = UIMessageQueue(LOG_PATH)
         self.thread = None
         self.worker = None
+        self._active_task_name = _('task_none')
+        self._drop_targets = {}
         self._suppress_auto_save = True
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
@@ -946,14 +1166,12 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QtGui.QIcon('icon.png'))
         self.init_system_tray()
         self.status.connect(lambda x: self.setWindowTitle(f"{_('window_title')} - {x}"))
-        self.resize(800, 600)
-        self.splashScreen = SplashScreen(self.windowIcon(), self)
-        self.splashScreen.setIconSize(QSize(102, 102))
+        self.resize(1180, 760)
+        self.setMinimumSize(960, 640)
         self.show()
         self.initUI()
         self._log_level_filter = 'ALL'  # 日志级别过滤默认值
         self.setup_timer()
-        self.splashScreen.finish()
 
     def _load_ui_language(self):
         """从 gui_settings.yaml 加载已保存的界面语言，在任何 _() 调用之前执行"""
@@ -984,13 +1202,23 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def selected_output_format(self, translation_enabled=None) -> str:
+        """Compose the legacy output value consumed by the processing pipeline."""
+        if translation_enabled is None:
+            translation_enabled = self.enable_translation_checkbox.isChecked()
+        content = self.output_content.currentData() or '双语'
+        container = self.output_container.currentData() or 'SRT'
+        return _compose_output_format(content, container, translation_enabled)
+
     def save_config(self, silent: bool = False):
         """保存 GUI 配置到 gui_settings.yaml 及相关文件"""
         if not silent:
             self._emit_status(_("status_reading_config"))
         asr_model_file = self.asr_model_file.currentText()
+        asr_aligner_file = self.asr_aligner_file.currentText()
+        asr_backend = self.asr_backend.currentText()
         translator = self.translator_group.currentText()
-        language = self.input_lang.currentText()
+        language = self.transcription_lang.currentText()
         gpt_token = self.gpt_token.text()
         gpt_address = self.gpt_address.text()
         gpt_model = self.gpt_model.text()
@@ -998,7 +1226,9 @@ class MainWindow(QMainWindow):
         sakura_mode = self.sakura_mode.text()
         proxy_address = self.proxy_address.text()
         uvr_file = self.uvr_file.currentText()
-        output_format = self.output_format.currentData()
+        output_content = self.output_content.currentData()
+        output_container = self.output_container.currentData()
+        output_format = self.selected_output_format()
         subtitle_font = self.subtitle_font_combo.currentText()
         output_dir = self.output_dir_edit.text().strip() or self.default_output_dir()
         use_input_dir = self.use_input_dir_checkbox.isChecked()
@@ -1009,10 +1239,13 @@ class MainWindow(QMainWindow):
         change_prompt_mode = self.change_prompt_mode.currentData() if hasattr(self, 'change_prompt_mode') else '不修改'
         auto_shutdown = self.auto_shutdown_checkbox.isChecked() if hasattr(self, 'auto_shutdown_checkbox') else False
         target_translation_lang = self.target_lang.currentData() if hasattr(self, 'target_lang') else 'zh-cn'
+        ui_theme = self.theme_selector.currentData() if hasattr(self, 'theme_selector') else _load_ui_theme()
         current_lang = get_language()
 
         gui_settings = {
             'asr_model_file': asr_model_file,
+            'asr_aligner_file': asr_aligner_file,
+            'asr_backend': asr_backend,
             'translator': translator,
             'language': language,
             'gpt_address': gpt_address,
@@ -1021,6 +1254,10 @@ class MainWindow(QMainWindow):
             'sakura_mode': sakura_mode,
             'proxy_address': proxy_address,
             'uvr_file': uvr_file,
+            'enable_transcription': self.enable_transcription_checkbox.isChecked(),
+            'enable_translation': self.enable_translation_checkbox.isChecked(),
+            'output_content': output_content,
+            'output_container': output_container,
             'output_format': output_format,
             'subtitle_font': subtitle_font,
             'output_dir': output_dir,
@@ -1029,9 +1266,11 @@ class MainWindow(QMainWindow):
             'enable_segment': enable_segment,
             'segment_duration': segment_duration,
             'change_prompt_mode': change_prompt_mode,
+            'auto_shutdown': auto_shutdown,
             'log_level_filter': self.log_filter_combo.currentText(),
             'verbose_mode': self.verbose_checkbox.isChecked(),
             'ui_language': current_lang,
+            'ui_theme': ui_theme,
             'target_translation_lang': target_translation_lang,
         }
         with open('gui_settings.yaml', 'w', encoding='utf-8') as f:
@@ -1058,7 +1297,22 @@ class MainWindow(QMainWindow):
             self._emit_status(_("status_config_saved"))
 
     def eventFilter(self, obj, event):
-        if event.type() == QtCore.QEvent.FocusOut:
+        drop_target = self._drop_targets.get(obj)
+        if drop_target is not None:
+            if event.type() in (
+                QtCore.QEvent.Type.DragEnter,
+                QtCore.QEvent.Type.DragMove,
+            ):
+                if self._normalize_drop_paths(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QtCore.QEvent.Type.Drop:
+                paths = self._normalize_drop_paths(event.mimeData())
+                if paths:
+                    drop_target.setPlainText("\n".join(paths))
+                    event.acceptProposedAction()
+                    return True
+        if event.type() == QtCore.QEvent.Type.FocusOut:
             self._schedule_auto_save()
         return super().eventFilter(obj, event)
 
@@ -1083,17 +1337,788 @@ class MainWindow(QMainWindow):
 
     def initUI(self):
         os.makedirs('separate', exist_ok=True)
-        self.initAboutTab()
+        # Build the feature sections first, then compose them into four focused
+        # navigation pages.  The section methods remain separate so their worker
+        # and configuration bindings stay easy to maintain.
         self.initInputOutputTab()
-        self.initClipTab()
-        self.initSynthTab()
-        self.initSummarizeTab()
         self.initSettingsTab()
         self.initAdvancedSettingTab()
         self.initDictTab()
+        self.initClipTab()
+        self.initSynthTab()
+        self.initSummarizeTab()
         self.initLogTab()
+        self.initAboutTab()
+
+        self._enhance_workflow_page()
+        self._build_config_page()
+        self._build_dictionary_page()
+        self._build_tools_page()
+        self._enhance_task_page()
+
+        workspace = QWidget(self)
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(14, 10, 14, 12)
+        workspace_layout.setSpacing(10)
+
+        self.top_tabs = QTabWidget(workspace)
+        self.top_tabs.setDocumentMode(True)
+        self.top_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.top_tabs.setUsesScrollButtons(True)
+        self.top_tabs.setStyleSheet(
+            "QTabBar::tab { min-width: 150px; min-height: 34px; padding: 4px 16px; }"
+            "QTabWidget::pane { border: 0; top: -1px; }"
+        )
+        self.top_tabs.addTab(self.about_tab, _("tab_about"))
+        self.top_tabs.addTab(self.input_output_tab, _("tab_workflow"))
+        self.top_tabs.addTab(self.config_tab, _("tab_config"))
+        self.top_tabs.addTab(self.dict_tab, _("tab_dict"))
+        self.top_tabs.addTab(self.tools_tab, _("tab_tools"))
+        self.top_tabs.addTab(self.log_tab, _("tab_tasks"))
+        workspace_layout.addWidget(self.top_tabs, 1)
+        workspace_layout.addWidget(self._make_shared_info_panel())
+        self.setCentralWidget(workspace)
+
         self._install_auto_save_signals()
         self.load_config()
+
+    def _make_shared_info_panel(self):
+        """Create the progress strip that remains visible below every top tab."""
+        panel = QFrame(self)
+        panel.setObjectName("shared-info-panel")
+        panel.setFrameShape(QFrame.Shape.NoFrame)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.addWidget(SubtitleLabel(_("progress_title")))
+        self.shared_task_label = BodyLabel(_("task_none"))
+        header.addWidget(self.shared_task_label)
+        header.addStretch()
+        self.shared_state_label = BodyLabel(_("task_state_idle"))
+        header.addWidget(self.shared_state_label)
+        layout.addLayout(header)
+
+        self.shared_progress_bar = QProgressBar()
+        self.shared_progress_bar.setRange(0, 1)
+        self.shared_progress_bar.setValue(0)
+        self.shared_progress_bar.setTextVisible(False)
+        self.shared_progress_bar.setMaximumHeight(5)
+        layout.addWidget(self.shared_progress_bar)
+
+        self.shared_progress_view = QPlainTextEdit()
+        self.shared_progress_view.setReadOnly(True)
+        self.shared_progress_view.setPlaceholderText(_("progress_placeholder"))
+        self.shared_progress_view.setMinimumHeight(48)
+        self.shared_progress_view.setMaximumHeight(64)
+        self.shared_progress_view.setStyleSheet(
+            "font-family: Consolas, Monospace; font-size: 9pt;"
+        )
+        layout.addWidget(self.shared_progress_view)
+        return panel
+
+    def _style_section(self, section: QFrame, title: str):
+        """Reflow a former navigation page as a borderless section."""
+        section.setParent(self)
+        section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        section.setFrameShape(QFrame.Shape.NoFrame)
+        section.setStyleSheet(f"QFrame#{section.objectName()} {{ border: 0; }}")
+        section.vBoxLayout.setContentsMargins(14, 12, 14, 14)
+        section.vBoxLayout.setSpacing(7)
+        section.vBoxLayout.insertWidget(0, SubtitleLabel(title))
+
+    def _scrollable_grid(self):
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setContentsMargins(2, 2, 8, 8)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        scroll.setWidget(content)
+        return scroll, grid
+
+    def _sync_combo_text(self, source, target):
+        text = source.currentText()
+        target.blockSignals(True)
+        target.setCurrentText(text)
+        target.blockSignals(False)
+
+    def _sync_line_text(self, source, target):
+        target.blockSignals(True)
+        target.setText(source.text())
+        target.blockSignals(False)
+
+    def _sync_check_state(self, source, target):
+        target.blockSignals(True)
+        target.setChecked(source.isChecked())
+        target.blockSignals(False)
+
+    def _sync_spin_value(self, source, target):
+        target.blockSignals(True)
+        target.setValue(source.value())
+        target.blockSignals(False)
+
+    def _bind_mirrored_pair(self, first, second, signal_name: str, sync_method):
+        getattr(first, signal_name).connect(
+            lambda *_args: sync_method(first, second)
+        )
+        getattr(second, signal_name).connect(
+            lambda *_args: sync_method(second, first)
+        )
+        sync_method(first, second)
+
+    def _clear_layout(self, layout):
+        """Detach all widgets/layouts so an existing section can be reflowed."""
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
+                child_layout.deleteLater()
+
+    def _action_column(self, *buttons):
+        panel = QFrame(self)
+        panel.setFrameShape(QFrame.Shape.NoFrame)
+        panel.setMinimumWidth(190)
+        panel.setMaximumWidth(230)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(SubtitleLabel(_("actions_title")))
+        for button in buttons:
+            layout.addWidget(button)
+        layout.addStretch()
+        return panel
+
+    def _enhance_workflow_page(self):
+        layout = self.input_output_layout
+        self._clear_layout(layout)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(10)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_widget = QWidget()
+        scroll.setWidget(scroll_widget)
+        content = QVBoxLayout(scroll_widget)
+        content.setContentsMargins(2, 2, 8, 8)
+        content.setSpacing(10)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        input_panel = QFrame(self)
+        input_panel.setFrameShape(QFrame.Shape.NoFrame)
+        form = QGridLayout(input_panel)
+        form.setContentsMargins(14, 12, 14, 14)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        row = 0
+
+        # 🌍 Language settings
+        form.addWidget(SubtitleLabel(_("workflow_section_lang")), row, 0, 1, 8)
+        row += 1
+        form.addWidget(self.lang_selector_label, row, 0)
+        form.addWidget(self.lang_selector, row, 1)
+        form.addWidget(BodyLabel(_("config_theme_label")), row, 2)
+        self.theme_selector = QComboBox()
+        for label_key, theme_file in UI_THEME_OPTIONS:
+            self.theme_selector.addItem(_(label_key), userData=theme_file)
+        current_theme_index = self.theme_selector.findData(_load_ui_theme())
+        if current_theme_index >= 0:
+            self.theme_selector.setCurrentIndex(current_theme_index)
+        self.theme_selector.currentIndexChanged.connect(self._on_theme_changed)
+        form.addWidget(self.theme_selector, row, 3)
+        form.addWidget(self.io_transcription_lang_label, row, 4)
+        form.addWidget(self.transcription_lang, row, 5)
+        form.addWidget(self.io_target_lang_label, row, 6)
+        form.addWidget(self.target_lang, row, 7)
+        row += 1
+
+        # 📂 Input files
+        form.addWidget(SubtitleLabel(_("workflow_section_input")), row, 0, 1, 8)
+        row += 1
+        form.addWidget(self.io_input_label, row, 0, 1, 8)
+        row += 1
+        self.input_files_list.setMinimumHeight(86)
+        self.input_files_list.setMaximumHeight(130)
+        form.addWidget(self.input_files_list, row, 0, 1, 8)
+        row += 1
+
+        # ⚙️ Processing options
+        form.addWidget(SubtitleLabel(_("workflow_section_options")), row, 0, 1, 8)
+        row += 1
+        form.addWidget(self.enable_transcription_checkbox, row, 0, 1, 4)
+        form.addWidget(self.enable_translation_checkbox, row, 4, 1, 4)
+        row += 1
+        form.addWidget(self.enable_segment_checkbox, row, 0, 1, 3)
+        form.addWidget(self.io_segment_duration_label, row, 3)
+        form.addWidget(self.segment_duration_spin, row, 4)
+        form.addWidget(self.use_input_dir_checkbox, row, 5, 1, 2)
+        form.addWidget(self.auto_shutdown_checkbox, row, 7)
+        row += 1
+
+        # 🌐 Network
+        form.addWidget(SubtitleLabel(_("workflow_section_network")), row, 0, 1, 8)
+        row += 1
+        form.addWidget(self.io_proxy_label, row, 0)
+        form.addWidget(self.proxy_address, row, 1, 1, 7)
+        row += 1
+
+        # 📁 Output
+        form.addWidget(SubtitleLabel(_("workflow_section_output")), row, 0, 1, 8)
+        row += 1
+        form.addWidget(self.io_output_dir_label, row, 0)
+        form.addWidget(self.output_dir_edit, row, 1, 1, 7)
+        row += 1
+        form.addWidget(self.io_format_label, row, 0)
+        form.addWidget(self.output_content, row, 1)
+        form.addWidget(self.io_container_label, row, 2)
+        form.addWidget(self.output_container, row, 3)
+        row += 1
+
+        for column in (1, 3, 5, 7):
+            form.setColumnStretch(column, 1)
+
+        body.addWidget(input_panel, 1)
+        body.addWidget(self._action_column(
+            self.run_button,
+            self.cancel_button,
+            self.output_dir_button,
+            self.open_output_button,
+            self.clean_button,
+        ))
+        content.addLayout(body, 1)
+        layout.addWidget(scroll, 1)
+
+    def _reflow_config_sections(self):
+        self._clear_layout(self.settings_layout)
+        speech_row = QHBoxLayout()
+        speech_panel = QFrame(self.settings_tab)
+        speech_panel.setFrameShape(QFrame.Shape.NoFrame)
+        speech_form = QGridLayout(speech_panel)
+        speech_form.setContentsMargins(14, 12, 14, 14)
+        speech_form.setHorizontalSpacing(10)
+        speech_form.setVerticalSpacing(8)
+        speech_form.addWidget(self.settings_asr_backend_label, 0, 0)
+        speech_form.addWidget(self.asr_backend, 0, 1)
+        speech_form.addWidget(self.settings_asr_model_label, 1, 0)
+        speech_form.addWidget(self.asr_model_file, 1, 1)
+        speech_form.addWidget(self.settings_asr_aligner_label, 2, 0)
+        speech_form.addWidget(self.asr_aligner_file, 2, 1)
+        speech_form.addWidget(self.settings_asr_param_label, 3, 0)
+        speech_form.addWidget(self.param_crispasr, 3, 1)
+        speech_form.setColumnStretch(1, 1)
+        speech_row.addWidget(speech_panel, 1)
+        speech_row.addWidget(self._action_column(
+            self.open_crispasr_dir,
+            self.refresh_speech_models_button,
+        ))
+        self.settings_layout.addLayout(speech_row)
+
+        self._clear_layout(self.advanced_settings_layout)
+        translation_row = QHBoxLayout()
+        translation_panel = QFrame(self.advanced_settings_tab)
+        translation_panel.setFrameShape(QFrame.Shape.NoFrame)
+        translation_form = QGridLayout(translation_panel)
+        translation_form.setContentsMargins(14, 12, 14, 14)
+        translation_form.setHorizontalSpacing(10)
+        translation_form.setVerticalSpacing(8)
+        translation_form.addWidget(self.adv_translator_label, 0, 0)
+        translation_form.addWidget(self.translator_group, 0, 1)
+        translation_form.addWidget(self.adv_concurrency_label, 0, 2)
+        translation_form.addWidget(self.max_concurrent_spin, 0, 3)
+        translation_form.addWidget(self.adv_online_token_label, 1, 0)
+        translation_form.addWidget(self.gpt_token, 1, 1, 1, 3)
+        translation_form.addWidget(self.adv_online_model_label, 2, 0)
+        translation_form.addWidget(self.gpt_model, 2, 1, 1, 3)
+        translation_form.addWidget(self.adv_online_address_label, 3, 0)
+        translation_form.addWidget(self.gpt_address, 3, 1, 1, 3)
+        translation_form.addWidget(self.adv_offline_model_label, 4, 0)
+        translation_form.addWidget(self.sakura_file, 4, 1)
+        translation_form.addWidget(self.adv_offline_gpu_label, 4, 2)
+        translation_form.addWidget(self.sakura_mode, 4, 3)
+        translation_form.addWidget(self.adv_offline_param_label, 5, 0)
+        translation_form.addWidget(self.param_llama, 5, 1, 1, 3)
+        translation_form.setColumnStretch(1, 1)
+        translation_form.setColumnStretch(3, 1)
+        translation_row.addWidget(translation_panel, 1)
+        translation_row.addWidget(self._action_column(
+            self.open_model_dir,
+            self.refresh_language_models_button,
+            self.test_online_button,
+        ))
+        self.advanced_settings_layout.addLayout(translation_row)
+
+    def _build_config_page(self):
+        self.config_tab = Widget("Configuration", self)
+        layout = self.config_tab.vBoxLayout
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(10)
+
+        self._reflow_config_sections()
+        self._style_section(self.settings_tab, _("config_speech_title"))
+        self._style_section(self.advanced_settings_tab, _("config_translation_title"))
+        self.param_crispasr.setMaximumHeight(130)
+        self.param_llama.setMaximumHeight(120)
+
+        scroll, grid = self._scrollable_grid()
+        grid.addWidget(self.settings_tab, 0, 0)
+        grid.addWidget(self.advanced_settings_tab, 1, 0)
+        grid.setColumnStretch(0, 1)
+        grid.setRowStretch(2, 1)
+        layout.addWidget(scroll, 1)
+
+    def _build_dictionary_page(self):
+        DICTIONARY_PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        layout = self.dict_layout
+        self._clear_layout(layout)
+        self.dict_tab.setObjectName("Dictionary")
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(10)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        inputs = QFrame(self.dict_tab)
+        inputs.setFrameShape(QFrame.Shape.NoFrame)
+        input_layout = QVBoxLayout(inputs)
+        input_layout.setContentsMargins(14, 12, 14, 14)
+        input_layout.setSpacing(6)
+        for label, editor in (
+            (self.dict_before_label, self.before_dict),
+            (self.dict_gpt_label, self.gpt_dict),
+            (self.dict_after_label, self.after_dict),
+            (self.dict_extra_label, self.extra_prompt),
+        ):
+            editor.setMinimumHeight(64)
+            editor.setMaximumHeight(94)
+            input_layout.addWidget(label)
+            input_layout.addWidget(editor)
+        prompt_row = QHBoxLayout()
+        prompt_row.addWidget(self.dict_prompt_mode_label)
+        prompt_row.addWidget(self.change_prompt_mode, 1)
+        input_layout.addLayout(prompt_row)
+        body.addWidget(inputs, 1)
+
+        preset_panel = QFrame(self.dict_tab)
+        preset_panel.setFrameShape(QFrame.Shape.NoFrame)
+        preset_panel.setMinimumWidth(220)
+        preset_panel.setMaximumWidth(260)
+        preset_layout = QVBoxLayout(preset_panel)
+        preset_layout.setContentsMargins(12, 12, 12, 12)
+        preset_layout.setSpacing(8)
+        preset_layout.addWidget(SubtitleLabel(_("dictionary_presets_title")))
+        preset_layout.addWidget(BodyLabel(_("dictionary_preset_name_label")))
+        self.dictionary_preset_combo = QComboBox()
+        self.dictionary_preset_combo.setEditable(True)
+        self.dictionary_preset_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        preset_layout.addWidget(self.dictionary_preset_combo)
+        self.save_dictionary_preset_button = QPushButton(_("dictionary_preset_save"))
+        self.load_dictionary_preset_button = QPushButton(_("dictionary_preset_load"))
+        self.refresh_dictionary_presets_button = QPushButton(_("dictionary_preset_refresh"))
+        self.open_dictionary_presets_button = QPushButton(_("dictionary_preset_open_dir"))
+        self.save_dictionary_preset_button.clicked.connect(self.save_dictionary_preset)
+        self.load_dictionary_preset_button.clicked.connect(self.load_dictionary_preset)
+        self.refresh_dictionary_presets_button.clicked.connect(self.refresh_dictionary_presets)
+        self.open_dictionary_presets_button.clicked.connect(
+            lambda: open_path(str(DICTIONARY_PRESET_DIR))
+        )
+        for button in (
+            self.save_dictionary_preset_button,
+            self.load_dictionary_preset_button,
+            self.refresh_dictionary_presets_button,
+            self.open_dictionary_presets_button,
+        ):
+            preset_layout.addWidget(button)
+        preset_layout.addStretch()
+        body.addWidget(preset_panel)
+        layout.addLayout(body, 1)
+        self.refresh_dictionary_presets()
+
+    @staticmethod
+    def _dictionary_preset_path(name: str) -> tuple[Path, str]:
+        invalid_filename_chars = set('<>:"/\\|?*')
+        safe_name = ''.join(
+            '_' if char in invalid_filename_chars or ord(char) < 32 else char
+            for char in (name or '')
+        )
+        safe_name = re.sub(r'\s+', ' ', safe_name).strip(' .')[:80]
+        if not safe_name:
+            raise ValueError(_("dictionary_preset_name_required"))
+        preset_dir = DICTIONARY_PRESET_DIR.resolve()
+        preset_dir.mkdir(parents=True, exist_ok=True)
+        return preset_dir / f"{safe_name}.yaml", safe_name
+
+    def refresh_dictionary_presets(self, selected_name: str | None = None):
+        DICTIONARY_PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        current = selected_name or self.dictionary_preset_combo.currentText().strip()
+        names = sorted(
+            path.stem for path in DICTIONARY_PRESET_DIR.glob('*.yaml')
+            if path.is_file()
+        )
+        self.dictionary_preset_combo.blockSignals(True)
+        self.dictionary_preset_combo.clear()
+        self.dictionary_preset_combo.addItems(names)
+        self.dictionary_preset_combo.setEditText(current if current else (names[0] if names else ''))
+        self.dictionary_preset_combo.blockSignals(False)
+
+    def save_dictionary_preset(self):
+        try:
+            path, safe_name = self._dictionary_preset_path(
+                self.dictionary_preset_combo.currentText()
+            )
+            payload = {
+                'version': 1,
+                'name': safe_name,
+                'before_dict': self.before_dict.toPlainText(),
+                'gpt_dict': self.gpt_dict.toPlainText(),
+                'after_dict': self.after_dict.toPlainText(),
+                'extra_prompt': self.extra_prompt.toPlainText(),
+                'change_prompt_mode': self.change_prompt_mode.currentData(),
+            }
+            temp_path = path.with_suffix('.yaml.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+            os.replace(temp_path, path)
+            self.refresh_dictionary_presets(safe_name)
+            self._emit_status(_("dictionary_preset_saved", name=safe_name))
+        except Exception as error:
+            self._emit_status(_("dictionary_preset_save_error", error=error))
+
+    def load_dictionary_preset(self):
+        try:
+            path, safe_name = self._dictionary_preset_path(
+                self.dictionary_preset_combo.currentText()
+            )
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = yaml.safe_load(f) or {}
+            self.before_dict.setPlainText(str(payload.get('before_dict', '')))
+            self.gpt_dict.setPlainText(str(payload.get('gpt_dict', '')))
+            self.after_dict.setPlainText(str(payload.get('after_dict', '')))
+            self.extra_prompt.setPlainText(str(payload.get('extra_prompt', '')))
+            prompt_mode = payload.get('change_prompt_mode', '不修改')
+            prompt_index = self.change_prompt_mode.findData(prompt_mode)
+            if prompt_index >= 0:
+                self.change_prompt_mode.setCurrentIndex(prompt_index)
+            self._schedule_auto_save()
+            self._emit_status(_("dictionary_preset_loaded", name=safe_name))
+        except Exception as error:
+            self._emit_status(_("dictionary_preset_load_error", error=error))
+
+    def _build_behavior_config_section(self):
+        section = Widget("OutputBehavior", self)
+        layout = section.vBoxLayout
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        grid.addWidget(BodyLabel(_("lang_selector_label")), 0, 0)
+        self.config_lang_selector = QComboBox()
+        for index in range(self.lang_selector.count()):
+            self.config_lang_selector.addItem(self.lang_selector.itemText(index))
+        grid.addWidget(self.config_lang_selector, 0, 1)
+        self._bind_mirrored_pair(
+            self.lang_selector, self.config_lang_selector,
+            'currentTextChanged', self._sync_combo_text,
+        )
+        self.config_lang_selector.currentIndexChanged.connect(self._on_language_changed)
+
+        grid.addWidget(BodyLabel(_("io_transcription_lang_label")), 0, 2)
+        self.config_transcription_lang = QComboBox()
+        for index in range(self.transcription_lang.count()):
+            self.config_transcription_lang.addItem(self.transcription_lang.itemText(index))
+        grid.addWidget(self.config_transcription_lang, 0, 3)
+        self._bind_mirrored_pair(
+            self.transcription_lang, self.config_transcription_lang,
+            'currentTextChanged', self._sync_combo_text,
+        )
+
+
+        grid.addWidget(BodyLabel(_("io_target_lang_label")), 0, 4)
+        self.config_target_lang = QComboBox()
+        for index in range(self.target_lang.count()):
+            self.config_target_lang.addItem(self.target_lang.itemText(index))
+        grid.addWidget(self.config_target_lang, 0, 5)
+        self._bind_mirrored_pair(
+            self.target_lang, self.config_target_lang,
+            'currentTextChanged', self._sync_combo_text,
+        )
+
+        grid.addWidget(BodyLabel(_("config_theme_label")), 1, 0)
+        self.theme_selector = QComboBox()
+        for label_key, theme_file in UI_THEME_OPTIONS:
+            self.theme_selector.addItem(_(label_key), userData=theme_file)
+        current_theme_index = self.theme_selector.findData(_load_ui_theme())
+        if current_theme_index >= 0:
+            self.theme_selector.setCurrentIndex(current_theme_index)
+        self.theme_selector.currentIndexChanged.connect(self._on_theme_changed)
+        grid.addWidget(self.theme_selector, 1, 1)
+
+        grid.addWidget(BodyLabel(_("io_output_content_label")), 1, 2)
+        self.config_output_content = QComboBox()
+        for index in range(self.output_content.count()):
+            self.config_output_content.addItem(self.output_content.itemText(index))
+        grid.addWidget(self.config_output_content, 1, 3)
+        self._bind_mirrored_pair(
+            self.output_content, self.config_output_content,
+            'currentTextChanged', self._sync_combo_text,
+        )
+
+        grid.addWidget(BodyLabel(_("synth_font_label")), 1, 4)
+        self.config_subtitle_font = QComboBox()
+        for index in range(self.subtitle_font_combo.count()):
+            self.config_subtitle_font.addItem(self.subtitle_font_combo.itemText(index))
+        grid.addWidget(self.config_subtitle_font, 1, 5)
+        self._bind_mirrored_pair(
+            self.subtitle_font_combo, self.config_subtitle_font,
+            'currentTextChanged', self._sync_combo_text,
+        )
+
+        grid.addWidget(BodyLabel(_("io_proxy_label")), 2, 0)
+        self.config_proxy_address = QLineEdit()
+        self.config_proxy_address.setPlaceholderText(_("io_proxy_placeholder"))
+        grid.addWidget(self.config_proxy_address, 2, 1, 1, 5)
+        self._bind_mirrored_pair(
+            self.proxy_address, self.config_proxy_address,
+            'textChanged', self._sync_line_text,
+        )
+
+        grid.addWidget(BodyLabel(_("io_output_dir_label")), 3, 0)
+        self.config_output_dir = QLineEdit()
+        grid.addWidget(self.config_output_dir, 3, 1, 1, 4)
+        self._bind_mirrored_pair(
+            self.output_dir_edit, self.config_output_dir,
+            'textChanged', self._sync_line_text,
+        )
+        self.config_output_dir_button = QPushButton(_("io_browse_dir_btn"))
+        self.config_output_dir_button.clicked.connect(self.browse_output_dir)
+        grid.addWidget(self.config_output_dir_button, 3, 5)
+
+        options = QHBoxLayout()
+        self.config_use_input_dir = QCheckBox(self.use_input_dir_checkbox.text())
+        self.config_auto_shutdown = QCheckBox(self.auto_shutdown_checkbox.text())
+        self.config_enable_segment = QCheckBox(self.enable_segment_checkbox.text())
+        options.addWidget(self.config_use_input_dir)
+        options.addWidget(self.config_auto_shutdown)
+        options.addWidget(self.config_enable_segment)
+        options.addWidget(BodyLabel(_("io_segment_duration_label")))
+        self.config_segment_duration = QSpinBox()
+        self.config_segment_duration.setRange(1, 20)
+        options.addWidget(self.config_segment_duration)
+        options.addStretch()
+        layout.addLayout(grid)
+        layout.addLayout(options)
+
+        self._bind_mirrored_pair(
+            self.use_input_dir_checkbox, self.config_use_input_dir,
+            'stateChanged', self._sync_check_state,
+        )
+        self._bind_mirrored_pair(
+            self.auto_shutdown_checkbox, self.config_auto_shutdown,
+            'stateChanged', self._sync_check_state,
+        )
+        self._bind_mirrored_pair(
+            self.enable_segment_checkbox, self.config_enable_segment,
+            'stateChanged', self._sync_check_state,
+        )
+        self._bind_mirrored_pair(
+            self.segment_duration_spin, self.config_segment_duration,
+            'valueChanged', self._sync_spin_value,
+        )
+        self.config_use_input_dir.stateChanged.connect(self.update_output_dir_controls)
+        self.config_enable_segment.stateChanged.connect(self.update_segment_controls)
+        self.update_output_dir_controls()
+        self.update_segment_controls()
+        return section
+
+    def _reflow_tool_sections(self):
+        self._clear_layout(self.clip_layout)
+        clip_row = QHBoxLayout()
+        clip_panel = QFrame(self.clip_tab)
+        clip_panel.setFrameShape(QFrame.Shape.NoFrame)
+        clip_inputs = QVBoxLayout(clip_panel)
+        clip_inputs.setContentsMargins(14, 12, 14, 14)
+        clip_inputs.addWidget(self.clip_tool_label)
+        clip_inputs.addWidget(self.clip_files_list)
+        clip_times = QGridLayout()
+        clip_times.addWidget(self.clip_start_label, 0, 0)
+        clip_times.addWidget(self.clip_end_label, 0, 1)
+        clip_times.addWidget(self.clip_start_time, 1, 0)
+        clip_times.addWidget(self.clip_end_time, 1, 1)
+        clip_inputs.addLayout(clip_times)
+        clip_row.addWidget(clip_panel, 1)
+        clip_row.addWidget(self._action_column(self.run_clip_button))
+        self.clip_layout.addLayout(clip_row)
+
+        separator = QFrame(self.clip_tab)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        self.clip_layout.addWidget(separator)
+
+        vocal_row = QHBoxLayout()
+        vocal_panel = QFrame(self.clip_tab)
+        vocal_panel.setFrameShape(QFrame.Shape.NoFrame)
+        vocal_inputs = QVBoxLayout(vocal_panel)
+        vocal_inputs.setContentsMargins(14, 12, 14, 14)
+        vocal_inputs.addWidget(self.clip_vocal_split_label)
+        uvr_model_row = QHBoxLayout()
+        uvr_model_row.addWidget(self.clip_uvr_model_label)
+        uvr_model_row.addWidget(self.uvr_file)
+        uvr_model_row.addWidget(self.open_uvr_dir)
+        uvr_model_row.addStretch()
+        vocal_inputs.addLayout(uvr_model_row)
+        vocal_inputs.addWidget(self.uvr_file_list)
+        vocal_row.addWidget(vocal_panel, 1)
+        vocal_row.addWidget(self._action_column(self.run_uvr_button))
+        self.clip_layout.addLayout(vocal_row)
+
+        self._clear_layout(self.synth_layout)
+        video_row = QHBoxLayout()
+        video_panel = QFrame(self.synth_tab)
+        video_panel.setFrameShape(QFrame.Shape.NoFrame)
+        video_inputs = QVBoxLayout(video_panel)
+        video_inputs.setContentsMargins(14, 12, 14, 14)
+        video_inputs.addWidget(self.synth_label)
+        video_inputs.addWidget(self.synth_video_label)
+        video_inputs.addWidget(self.synth_video_files_list)
+        video_inputs.addWidget(self.synth_srt_label)
+        video_inputs.addWidget(self.synth_srt_files_list)
+        subtitle_options = QHBoxLayout()
+        subtitle_options.addWidget(self.synth_subtitle_type_label)
+        subtitle_options.addWidget(self.subtitle_type_combo)
+        subtitle_options.addWidget(self.synth_font_label)
+        subtitle_options.addWidget(self.subtitle_font_combo)
+        subtitle_options.addStretch()
+        video_inputs.addLayout(subtitle_options)
+        video_row.addWidget(video_panel, 1)
+        video_row.addWidget(self._action_column(
+            self.synth_video_browse_btn,
+            self.synth_srt_browse_btn,
+            self.run_synth_button,
+        ))
+        self.synth_layout.addLayout(video_row)
+
+        separator = QFrame(self.synth_tab)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        self.synth_layout.addWidget(separator)
+
+        audio_row = QHBoxLayout()
+        audio_panel = QFrame(self.synth_tab)
+        audio_panel.setFrameShape(QFrame.Shape.NoFrame)
+        audio_inputs = QVBoxLayout(audio_panel)
+        audio_inputs.setContentsMargins(14, 12, 14, 14)
+        audio_inputs.addWidget(self.synth_audio_label)
+        audio_inputs.addWidget(self.synth_audio_files_list)
+        audio_row.addWidget(audio_panel, 1)
+        audio_row.addWidget(self._action_column(self.run_synth_audio_button))
+        self.synth_layout.addLayout(audio_row)
+
+        self._clear_layout(self.summarize_layout)
+        summarize_row = QHBoxLayout()
+        summarize_panel = QFrame(self.summarize_tab)
+        summarize_panel.setFrameShape(QFrame.Shape.NoFrame)
+        summarize_inputs = QVBoxLayout(summarize_panel)
+        summarize_inputs.setContentsMargins(14, 12, 14, 14)
+        summarize_inputs.addWidget(self.summarize_prompt_label)
+        summarize_inputs.addWidget(self.summarize_prompt)
+        summarize_inputs.addWidget(self.summarize_input_label)
+        summarize_inputs.addWidget(self.summarize_files_list)
+        summarize_row.addWidget(summarize_panel, 1)
+        summarize_row.addWidget(self._action_column(self.run_summarize_button))
+        self.summarize_layout.addLayout(summarize_row)
+
+    def _build_tools_page(self):
+        self.tools_tab = Widget("Tools", self)
+        layout = self.tools_tab.vBoxLayout
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(10)
+
+        self._reflow_tool_sections()
+        self._style_section(self.clip_tab, _("tools_clip_title"))
+        self._style_section(self.synth_tab, _("tools_synth_title"))
+        self._style_section(self.summarize_tab, _("tools_summarize_title"))
+        for editor in (
+            self.clip_files_list, self.uvr_file_list, self.synth_video_files_list,
+            self.synth_srt_files_list, self.synth_audio_files_list,
+            self.summarize_prompt, self.summarize_files_list,
+        ):
+            editor.setMinimumHeight(72)
+            editor.setMaximumHeight(108)
+
+        scroll, grid = self._scrollable_grid()
+        grid.addWidget(self.clip_tab, 0, 0)
+        grid.addWidget(self.synth_tab, 1, 0)
+        grid.addWidget(self.summarize_tab, 2, 0)
+        grid.setColumnStretch(0, 1)
+        grid.setRowStretch(3, 1)
+        layout.addWidget(scroll, 1)
+
+    def _enhance_task_page(self):
+        self.log_tab.setObjectName("Tasks")
+        layout = self.log_layout
+        self._clear_layout(layout)
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(8)
+
+        log_row = QHBoxLayout()
+        log_inputs = QVBoxLayout()
+        log_inputs.addWidget(self.log_file_label)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(self.log_filter_label)
+        filter_row.addWidget(self.log_filter_combo)
+        filter_row.addStretch()
+        filter_row.addWidget(self.verbose_checkbox)
+        log_inputs.addLayout(filter_row)
+        log_inputs.addWidget(self.log_display, 1)
+        log_row.addLayout(log_inputs, 1)
+
+        self.clear_log_button = QPushButton(_("log_clear_btn"))
+        self.clear_log_button.clicked.connect(self.clear_log)
+        log_row.addWidget(self._action_column(
+            self.open_log_button,
+            self.clear_log_button,
+        ))
+        layout.addLayout(log_row, 1)
+
+    def clear_log(self):
+        self.log_display.clear()
+        try:
+            open(LOG_PATH, 'w', encoding='utf-8').close()
+        except OSError:
+            pass
+
+    def _set_progress_context(self, task_name: str):
+        self._active_task_name = task_name
+        self.shared_progress_view.clear()
+        self.shared_progress_bar.setRange(0, 0)
+        self.shared_task_label.setText(task_name)
+        self.shared_state_label.setText(_("task_state_running"))
+
+    def _on_task_finished(self):
+        self.shared_progress_bar.setRange(0, 1)
+        self.shared_progress_bar.setValue(1)
+        self.shared_state_label.setText(_("task_state_done"))
+
+    def _start_worker_task(self, operation: str, task_name: str,
+                           show_model_dialog: bool = False):
+        if self.thread is not None and self.thread.isRunning():
+            self._emit_status(_("status_task_busy"))
+            return
+        self._set_progress_context(task_name)
+        self.thread = QThread()
+        self.worker = MainWorker(self)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(getattr(self.worker, operation))
+        if show_model_dialog:
+            self.worker.show_model_dialog.connect(self.show_model_selection_dialog)
+        self.worker.finished.connect(self._on_task_finished)
+        self.worker.finished.connect(self.thread.quit)
+        self.thread.start()
 
     def browse_synth_video(self):
         files, _unused = QFileDialog.getOpenFileNames(self, _("dialog_select_video"), "", "Video Files (*.mp4 *.mkv *.avi *.mov *.flv);;All Files (*)")
@@ -1125,10 +2150,22 @@ class MainWindow(QMainWindow):
         use_input_dir = self.use_input_dir_checkbox.isChecked() if hasattr(self, 'use_input_dir_checkbox') else False
         self.output_dir_edit.setEnabled(not use_input_dir)
         self.output_dir_button.setEnabled(not use_input_dir)
+        if hasattr(self, 'config_output_dir'):
+            self.config_output_dir.setEnabled(not use_input_dir)
+            self.config_output_dir_button.setEnabled(not use_input_dir)
 
     def update_segment_controls(self):
         enabled = self.enable_segment_checkbox.isChecked() if hasattr(self, 'enable_segment_checkbox') else False
         self.segment_duration_spin.setEnabled(enabled)
+        if hasattr(self, 'config_segment_duration'):
+            self.config_segment_duration.setEnabled(enabled)
+
+    def update_synth_font_controls(self):
+        enabled = (self.subtitle_type_combo.currentData() or "硬字幕") == "硬字幕"
+        self.synth_font_label.setEnabled(enabled)
+        self.subtitle_font_combo.setEnabled(enabled)
+        if hasattr(self, 'config_subtitle_font'):
+            self.config_subtitle_font.setEnabled(enabled)
 
     def _normalize_drop_paths(self, mime_data):
         paths = []
@@ -1163,11 +2200,13 @@ class MainWindow(QMainWindow):
         return paths
 
     def _bind_drop_event(self, text_edit):
-        def _on_drop(event):
-            paths = self._normalize_drop_paths(event.mimeData())
-            if paths:
-                text_edit.setPlainText("\n".join(paths))
-        text_edit.dropEvent = _on_drop
+        text_edit.setAcceptDrops(True)
+        text_edit.installEventFilter(self)
+        self._drop_targets[text_edit] = text_edit
+        viewport = text_edit.viewport()
+        viewport.setAcceptDrops(True)
+        viewport.installEventFilter(self)
+        self._drop_targets[viewport] = text_edit
 
     def collect_font_candidates(self):
         # Scan ./font and common system font dirs for ttf/ttc/otf files
@@ -1200,13 +2239,31 @@ class MainWindow(QMainWindow):
         return unique
 
     def refresh_speech_model_lists(self):
+        if hasattr(self, 'asr_backend'):
+            current_backend = self.asr_backend.currentText()
+            backends = _list_crispasr_backends()
+            if current_backend and current_backend not in backends:
+                backends.append(current_backend)
+            self.asr_backend.clear()
+            self.asr_backend.addItems(backends)
+            if current_backend in backends:
+                self.asr_backend.setCurrentText(current_backend)
+
         if hasattr(self, 'asr_model_file'):
             current_model = self.asr_model_file.currentText()
-            asr_models = _list_crispasr_models() + [NO_TRANSCRIPTION]
+            asr_models = _list_crispasr_models()
             self.asr_model_file.clear()
             self.asr_model_file.addItems(asr_models)
             if current_model in asr_models:
                 self.asr_model_file.setCurrentText(current_model)
+
+        if hasattr(self, 'asr_aligner_file'):
+            current_aligner = self.asr_aligner_file.currentText()
+            aligners = _list_crispasr_aligners()
+            self.asr_aligner_file.clear()
+            self.asr_aligner_file.addItems(aligners)
+            if current_aligner in aligners:
+                self.asr_aligner_file.setCurrentText(current_aligner)
 
         if hasattr(self, 'uvr_file'):
             current_uvr = self.uvr_file.currentText()
@@ -1254,7 +2311,11 @@ class MainWindow(QMainWindow):
 
         gui_settings = {
             'asr_model_file': lines[0].strip(),
+            'asr_aligner_file': '',
+            'asr_backend': DEFAULT_CRISPASR_BACKEND,
             'translator': lines[1].strip(),
+            'enable_transcription': lines[0].strip() != NO_TRANSCRIPTION,
+            'enable_translation': lines[1].strip() != NO_TRANSLATION,
             'language': lines[2].strip(),
             'gpt_address': lines[4].strip(),
             'gpt_model': lines[5].strip(),
@@ -1290,10 +2351,39 @@ class MainWindow(QMainWindow):
 
         if gui_settings:
             saved_asr_model = gui_settings.get('asr_model_file') or gui_settings.get('whisper_file')
-            if self.asr_model_file and saved_asr_model:
+            legacy_transcription_disabled = saved_asr_model == NO_TRANSCRIPTION
+            if (
+                self.asr_model_file
+                and saved_asr_model
+                and not legacy_transcription_disabled
+                and self.asr_model_file.findText(saved_asr_model) >= 0
+            ):
                 self.asr_model_file.setCurrentText(saved_asr_model)
-            self.translator_group.setCurrentText(gui_settings.get('translator', ''))
-            self.input_lang.setCurrentText(gui_settings.get('language', ''))
+            self.enable_transcription_checkbox.setChecked(
+                gui_settings.get('enable_transcription', not legacy_transcription_disabled)
+            )
+            saved_aligner = (
+                gui_settings.get('asr_aligner_file')
+                or gui_settings.get('aligner_model_file')
+            )
+            if saved_aligner and self.asr_aligner_file.findText(saved_aligner) >= 0:
+                self.asr_aligner_file.setCurrentText(saved_aligner)
+            saved_backend = gui_settings.get('asr_backend', DEFAULT_CRISPASR_BACKEND)
+            if self.asr_backend.findText(saved_backend) < 0:
+                self.asr_backend.addItem(saved_backend)
+            self.asr_backend.setCurrentText(saved_backend)
+            saved_translator = gui_settings.get('translator', '')
+            legacy_translation_disabled = saved_translator == NO_TRANSLATION
+            if (
+                saved_translator
+                and not legacy_translation_disabled
+                and self.translator_group.findText(saved_translator) >= 0
+            ):
+                self.translator_group.setCurrentText(saved_translator)
+            self.enable_translation_checkbox.setChecked(
+                gui_settings.get('enable_translation', not legacy_translation_disabled)
+            )
+            self.transcription_lang.setCurrentText(gui_settings.get('language', ''))
             self.gpt_address.setText(gui_settings.get('gpt_address', ''))
             self.gpt_model.setText(gui_settings.get('gpt_model', ''))
             if self.sakura_file:
@@ -1306,9 +2396,18 @@ class MainWindow(QMainWindow):
             # 迁移旧值：中文SRT/LRC → 目标SRT/LRC
             _fmt_migrate = {'中文SRT': '目标SRT', '中文LRC': '目标LRC'}
             _fmt_loaded = _fmt_migrate.get(_fmt_loaded, _fmt_loaded)
-            _fmt_idx = self.output_format.findData(_fmt_loaded)
-            if _fmt_idx >= 0:
-                self.output_format.setCurrentIndex(_fmt_idx)
+            output_content = gui_settings.get('output_content')
+            if output_content not in ('双语', '目标'):
+                output_content = '双语' if _fmt_loaded.startswith('双语') else '目标'
+            output_container = gui_settings.get('output_container')
+            if output_container not in ('SRT', 'LRC'):
+                output_container = 'LRC' if _fmt_loaded.endswith('LRC') else 'SRT'
+            content_index = self.output_content.findData(output_content)
+            if content_index >= 0:
+                self.output_content.setCurrentIndex(content_index)
+            container_index = self.output_container.findData(output_container)
+            if container_index >= 0:
+                self.output_container.setCurrentIndex(container_index)
             subtitle_font = gui_settings.get('subtitle_font', '')
             if subtitle_font:
                 self.subtitle_font_combo.setCurrentText(subtitle_font)
@@ -1319,6 +2418,8 @@ class MainWindow(QMainWindow):
             self.max_concurrent_spin.setValue(gui_settings.get('max_concurrent', 1))
             self.enable_segment_checkbox.setChecked(gui_settings.get('enable_segment', False))
             self.segment_duration_spin.setValue(gui_settings.get('segment_duration', 10))
+            if hasattr(self, 'auto_shutdown_checkbox'):
+                self.auto_shutdown_checkbox.setChecked(gui_settings.get('auto_shutdown', False))
             change_prompt_mode = gui_settings.get('change_prompt_mode', '')
             if hasattr(self, 'change_prompt_mode') and change_prompt_mode:
                 _pm_idx = self.change_prompt_mode.findData(change_prompt_mode)
@@ -1331,6 +2432,12 @@ class MainWindow(QMainWindow):
                 self._log_level_filter = log_filter
             if hasattr(self, 'verbose_checkbox'):
                 self.verbose_checkbox.setChecked(gui_settings.get('verbose_mode', False))
+            if hasattr(self, 'theme_selector'):
+                _theme_idx = self.theme_selector.findData(
+                    gui_settings.get('ui_theme', DEFAULT_UI_THEME)
+                )
+                if _theme_idx >= 0:
+                    self.theme_selector.setCurrentIndex(_theme_idx)
             if hasattr(self, 'target_lang'):
                 _tl_idx = self.target_lang.findData(gui_settings.get('target_translation_lang', 'zh-cn'))
                 if _tl_idx >= 0:
@@ -1425,11 +2532,11 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.restore_from_tray()
 
     def _consume_messages(self):
-        """定时器回调：从统一消息队列消费并分发到两个显示框"""
+        """Show status in the shared footer and keep Tasks as the full history."""
         if not hasattr(self, 'msg_queue'):
             return
 
@@ -1439,12 +2546,11 @@ class MainWindow(QMainWindow):
 
         for target, text in entries:
             if UIMessageQueue.is_completion_entry(target):
-                # 完成哨兵：两个框都追加
                 completion_msg = _("status_all_done")
-                self.output_text_edit.append(completion_msg)
                 self.log_display.appendPlainText(completion_msg)
+                self.shared_progress_view.appendPlainText(completion_msg)
             elif target == 'status':
-                self.output_text_edit.append(text)
+                self.shared_progress_view.appendPlainText(text)
             elif target == 'detail':
                 # 应用日志级别过滤
                 if self._log_level_filter != 'ALL':
@@ -1452,8 +2558,8 @@ class MainWindow(QMainWindow):
                         continue
                 self.log_display.appendPlainText(text)
 
-        # 自动滚动两个框到底部
-        for widget in (self.output_text_edit, self.log_display):
+        # Keep the aggregate history and the shared compact feed at the end.
+        for widget in (self.log_display, self.shared_progress_view):
             scrollbar = widget.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
@@ -1514,32 +2620,27 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         # Hide window instead of cluttering the taskbar when minimized
         super().changeEvent(event)
-        if event.type() == QtCore.QEvent.WindowStateChange and self.isMinimized():
+        if event.type() == QtCore.QEvent.Type.WindowStateChange and self.isMinimized():
             if getattr(self, 'tray_icon', None):
                 QTimer.singleShot(0, self.hide)
-                self.tray_icon.showMessage("VoiceTransl", _("tray_minimized"), QSystemTrayIcon.Information, 2000)
+                self.tray_icon.showMessage(
+                    "VoiceTransl", _("tray_minimized"),
+                    QSystemTrayIcon.MessageIcon.Information, 2000,
+                )
 
-        if event.type() == QtCore.QEvent.ActivationChange and not self.isActiveWindow():
+        if event.type() == QtCore.QEvent.Type.ActivationChange and not self.isActiveWindow():
             self._schedule_auto_save()
 
     def initLogTab(self):
         self.log_tab = Widget("Log", self)
         self.log_layout = self.log_tab.vBoxLayout
 
-        self.log_realtime_label = BodyLabel(_("log_realtime_label"))
-        self.log_layout.addWidget(self.log_realtime_label)
-
-        self.output_text_edit = QTextEdit()
-        self.output_text_edit.setReadOnly(True)
-        self.output_text_edit.setPlaceholderText(_("log_realtime_placeholder"))
-        self.log_layout.addWidget(self.output_text_edit)
-
         self.log_file_label = BodyLabel(_("log_file_label"))
         self.log_layout.addWidget(self.log_file_label)
 
         # 日志过滤工具栏
         filter_layout = QHBoxLayout()
-        filter_label = QLabel(_("log_filter_label"))
+        self.log_filter_label = QLabel(_("log_filter_label"))
         self.log_filter_combo = QComboBox()
         self.log_filter_combo.addItems(["ALL", "INFO+", "WARNING+", "ERROR+"])
         self.log_filter_combo.currentTextChanged.connect(self._on_log_filter_changed)
@@ -1549,7 +2650,7 @@ class MainWindow(QMainWindow):
         self.verbose_checkbox.setToolTip(_("log_verbose_tooltip"))
         self.verbose_checkbox.stateChanged.connect(self._on_verbose_changed)
 
-        filter_layout.addWidget(filter_label)
+        filter_layout.addWidget(self.log_filter_label)
         filter_layout.addWidget(self.log_filter_combo)
         filter_layout.addStretch()
         filter_layout.addWidget(self.verbose_checkbox)
@@ -1566,61 +2667,80 @@ class MainWindow(QMainWindow):
         self.open_log_button.clicked.connect(lambda: open_path(LOG_PATH))
         self.log_layout.addWidget(self.open_log_button)
 
-        self.addSubInterface(self.log_tab, FluentIcon.INFO, _("tab_log"), NavigationItemPosition.TOP)
-
     def _on_log_filter_changed(self, filter_text: str):
         """级别过滤变更：仅影响后续到达的 detail 消息（已显示内容不变）"""
         self._log_level_filter = filter_text
 
     def _on_verbose_changed(self, state: int):
         """详细模式复选框变更"""
-        ConcurrentTranslationPool.verbose_galtransl = (state == Qt.Checked)
+        ConcurrentTranslationPool.verbose_galtransl = bool(state)
 
     def initAboutTab(self):
         self.about_tab = Widget("About", self)
         self.about_layout = self.about_tab.vBoxLayout
+        self.about_layout.setContentsMargins(24, 18, 24, 20)
+        self.about_layout.setSpacing(10)
 
-        # introduce
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        content_panel = QFrame(self.about_tab)
+        content_panel.setFrameShape(QFrame.Shape.NoFrame)
+        content = QVBoxLayout(content_panel)
+        content.setContentsMargins(14, 12, 14, 14)
+        content.setSpacing(8)
+
+        # avatar image
+        avatar_path = os.path.abspath(os.path.join(os.getcwd(), 'avatar.png'))
+        self.avatar_label = ScaledPixmapLabel(QPixmap(avatar_path))
+        self.avatar_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        content.addWidget(self.avatar_label, 1)
+
+        # welcome title
         self.about_title_label = TitleLabel(_("about_title"))
-        self.about_layout.addWidget(self.about_title_label)
+        content.addWidget(self.about_title_label)
 
-        # mode
-        self.mode_text = QTextEdit()
-        self.mode_text.setReadOnly(True)
-        self.mode_text.setPlainText(_("about_text"))
-        self.about_layout.addWidget(self.mode_text)
-
-        # wiki button
-        self.btn_wiki = QPushButton(_("about_wiki_btn"))
-        self.btn_wiki.clicked.connect(lambda: open_url("https://github.com/shinnpuru/VoiceTransl/wiki"))
-        self.about_layout.addWidget(self.btn_wiki)
-
-        # sponsorship buttons
-        self.about_sponsor_title = TitleLabel(_("about_sponsor_title"))
-        self.about_layout.addWidget(self.about_sponsor_title)
-        btn_layout = QHBoxLayout()
-        self.btn_afdian = QPushButton(_("about_afdian_btn"))
-        self.btn_bilibili = QPushButton(_("about_bilibili_btn"))
-        self.btn_kofi = QPushButton(_("about_kofi_btn"))
+        body.addWidget(content_panel, 1)
 
         def open_url(url):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
+        # start
+        self.start_button = QPushButton(_("about_start_btn"))
+        self.start_button.clicked.connect(
+            lambda: self.top_tabs.setCurrentWidget(self.input_output_tab)
+        )
+
+        # wiki button
+        self.btn_wiki = QPushButton(_("about_wiki_btn"))
+        self.btn_wiki.clicked.connect(lambda: open_url("https://github.com/shinnpuru/VoiceTransl"))
+
+        # sponsorship buttons
+        self.about_sponsor_title = SubtitleLabel(_("about_sponsor_title"))
+        self.btn_afdian = QPushButton(_("about_afdian_btn"))
+        self.btn_bilibili = QPushButton(_("about_bilibili_btn"))
+        self.btn_kofi = QPushButton(_("about_kofi_btn"))
         self.btn_afdian.clicked.connect(lambda: open_url("https://afdian.com/a/shinnpuru"))
         self.btn_bilibili.clicked.connect(lambda: open_url("https://space.bilibili.com/36464441"))
         self.btn_kofi.clicked.connect(lambda: open_url("https://ko-fi.com/U7U018MISY"))
 
-        btn_layout.addWidget(self.btn_afdian)
-        btn_layout.addWidget(self.btn_bilibili)
-        btn_layout.addWidget(self.btn_kofi)
-        self.about_layout.addLayout(btn_layout)
-
-        # start
-        self.start_button = QPushButton(_("about_start_btn"))
-        self.start_button.clicked.connect(lambda: self.switchTo(self.input_output_tab))
-        self.about_layout.addWidget(self.start_button)
-
-        self.addSubInterface(self.about_tab, FluentIcon.HEART, _("tab_about"), NavigationItemPosition.TOP)
+        action_panel = QFrame(self.about_tab)
+        action_panel.setFrameShape(QFrame.Shape.NoFrame)
+        action_panel.setMinimumWidth(190)
+        action_panel.setMaximumWidth(230)
+        action_layout = QVBoxLayout(action_panel)
+        action_layout.setContentsMargins(12, 12, 12, 12)
+        action_layout.setSpacing(8)
+        action_layout.addWidget(SubtitleLabel(_("actions_title")))
+        action_layout.addWidget(self.start_button)
+        action_layout.addWidget(self.btn_wiki)
+        action_layout.addWidget(self.about_sponsor_title)
+        action_layout.addWidget(self.btn_afdian)
+        action_layout.addWidget(self.btn_bilibili)
+        action_layout.addWidget(self.btn_kofi)
+        action_layout.addStretch()
+        body.addWidget(action_panel)
+        self.about_layout.addLayout(body, 1)
 
     def _on_language_changed(self, index: int):
         """界面语言变更：保存设置并提示重启后生效"""
@@ -1638,9 +2758,17 @@ class MainWindow(QMainWindow):
             self.tray_icon.showMessage(
                 _("notify_lang_changed_title"),
                 _("notify_lang_changed_msg"),
-                QSystemTrayIcon.Information,
+                QSystemTrayIcon.MessageIcon.Information,
                 3000
             )
+
+    def _on_theme_changed(self, _index: int):
+        theme = self.theme_selector.currentData()
+        application = QApplication.instance()
+        if application and theme:
+            apply_material_theme(application, theme)
+        if not self._suppress_auto_save:
+            self._schedule_auto_save()
 
     def initInputOutputTab(self):
         self.input_output_tab = Widget("Home", self)
@@ -1681,44 +2809,64 @@ class MainWindow(QMainWindow):
         lang_layout.addWidget(self.target_lang)
         self.input_output_layout.addLayout(lang_layout)
 
+        processing_layout = QHBoxLayout()
+        self.enable_transcription_checkbox = QCheckBox(_("workflow_enable_transcription"))
+        self.enable_transcription_checkbox.setChecked(True)
+        processing_layout.addWidget(self.enable_transcription_checkbox)
+        processing_layout.addStretch()
+        self.enable_translation_checkbox = QCheckBox(_("workflow_enable_translation"))
+        self.enable_translation_checkbox.setChecked(True)
+        processing_layout.addWidget(self.enable_translation_checkbox)
+        processing_layout.addStretch()
+        self.input_output_layout.addLayout(processing_layout)
+
         # Input Section (local files or URLs)
         self.io_input_label = BodyLabel(_("io_input_label"))
+        self.io_input_label.setToolTip(_("tip_io_input"))
         self.input_output_layout.addWidget(self.io_input_label)
         self.input_files_list = QTextEdit()
         self.input_files_list.setAcceptDrops(True)
         self._bind_drop_event(self.input_files_list)
         self.input_files_list.setPlaceholderText(_("io_input_placeholder"))
+        self.input_files_list.setToolTip(_("tip_io_input"))
         self.input_output_layout.addWidget(self.input_files_list)
 
         # Segment Section
         segment_layout = QHBoxLayout()
         self.enable_segment_checkbox = QCheckBox(_("io_segment_checkbox"))
+        self.enable_segment_checkbox.setToolTip(_("tip_io_segment"))
         self.enable_segment_checkbox.stateChanged.connect(self.update_segment_controls)
         segment_layout.addWidget(self.enable_segment_checkbox)
         self.io_segment_duration_label = BodyLabel(_("io_segment_duration_label"))
+        self.io_segment_duration_label.setToolTip(_("tip_io_segment_duration"))
         segment_layout.addWidget(self.io_segment_duration_label)
         self.segment_duration_spin = QSpinBox()
         self.segment_duration_spin.setRange(1, 20)
         self.segment_duration_spin.setValue(10)
         self.segment_duration_spin.setEnabled(False)
+        self.segment_duration_spin.setToolTip(_("tip_io_segment_duration"))
         segment_layout.addWidget(self.segment_duration_spin)
         segment_layout.addStretch()
         self.input_output_layout.addLayout(segment_layout)
 
         # Proxy Section
         self.io_proxy_label = BodyLabel(_("io_proxy_label"))
+        self.io_proxy_label.setToolTip(_("tip_io_proxy"))
         self.input_output_layout.addWidget(self.io_proxy_label)
         self.proxy_address = QLineEdit()
         self.proxy_address.setPlaceholderText(_("io_proxy_placeholder"))
+        self.proxy_address.setToolTip(_("tip_io_proxy"))
         self.input_output_layout.addWidget(self.proxy_address)
 
         # Output Directory Section
         self.io_output_dir_label = BodyLabel(_("io_output_dir_label"))
+        self.io_output_dir_label.setToolTip(_("tip_io_output_dir"))
         self.input_output_layout.addWidget(self.io_output_dir_label)
         output_dir_layout = QHBoxLayout()
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText(self.default_output_dir())
         self.output_dir_edit.setText(self.default_output_dir())
+        self.output_dir_edit.setToolTip(_("tip_io_output_dir"))
         output_dir_layout.addWidget(self.output_dir_edit)
         self.output_dir_button = QPushButton(_("io_browse_dir_btn"))
         self.output_dir_button.clicked.connect(self.browse_output_dir)
@@ -1727,6 +2875,7 @@ class MainWindow(QMainWindow):
 
         selection_layout = QHBoxLayout()
         self.use_input_dir_checkbox = QCheckBox(_("io_use_input_dir_checkbox"))
+        self.use_input_dir_checkbox.setToolTip(_("tip_io_use_input_dir"))
         self.use_input_dir_checkbox.stateChanged.connect(self.update_output_dir_controls)
         selection_layout.addWidget(self.use_input_dir_checkbox)
         selection_layout.addStretch()
@@ -1735,23 +2884,21 @@ class MainWindow(QMainWindow):
         selection_layout.addStretch()
         self.input_output_layout.addLayout(selection_layout)
         
-        # Format Section
-        self.io_format_label = BodyLabel(_("io_format_label"))
+        # Subtitle content and container are independent.  With translation
+        # disabled the processing pipeline automatically outputs the original.
+        self.io_format_label = BodyLabel(_("io_output_content_label"))
         self.input_output_layout.addWidget(self.io_format_label)
-        self.output_format = QComboBox()
-        for _fmt_val, _fmt_key in (
-            ('原文SRT', 'format_original_srt'),
-            ('原文LRC', 'format_original_lrc'),
-            ('目标LRC', 'format_target_lrc'),
-            ('双语LRC', 'format_bilingual_lrc'),
-            ('目标SRT', 'format_target_srt'),
-            ('双语SRT', 'format_bilingual_srt'),
-        ):
-            self.output_format.addItem(_(_fmt_key), userData=_fmt_val)
-        _default_fmt_idx = self.output_format.findData('双语SRT')
-        if _default_fmt_idx >= 0:
-            self.output_format.setCurrentIndex(_default_fmt_idx)
-        self.input_output_layout.addWidget(self.output_format)
+        self.output_content = QComboBox()
+        self.output_content.addItem(_("output_content_bilingual"), userData='双语')
+        self.output_content.addItem(_("output_content_target"), userData='目标')
+        self.input_output_layout.addWidget(self.output_content)
+
+        self.io_container_label = BodyLabel(_("io_output_container_label"))
+        self.input_output_layout.addWidget(self.io_container_label)
+        self.output_container = QComboBox()
+        self.output_container.addItem(_("output_container_srt"), userData='SRT')
+        self.output_container.addItem(_("output_container_lrc"), userData='LRC')
+        self.input_output_layout.addWidget(self.output_container)
 
 
         button_layout = QHBoxLayout()
@@ -1773,8 +2920,6 @@ class MainWindow(QMainWindow):
 
         # Add the button row layout to the input output layout
         self.input_output_layout.addLayout(button_layout)
-
-        self.addSubInterface(self.input_output_tab, FluentIcon.HOME, _("tab_input_output"), NavigationItemPosition.TOP)
 
     def initDictTab(self):
         self.dict_tab = Widget("Dict", self)
@@ -1805,8 +2950,10 @@ class MainWindow(QMainWindow):
         self.dict_layout.addWidget(self.extra_prompt)
 
         self.dict_prompt_mode_label = BodyLabel(_("dict_prompt_mode_label"))
+        self.dict_prompt_mode_label.setToolTip(_("tip_dict_prompt_mode"))
         self.dict_layout.addWidget(self.dict_prompt_mode_label)
         self.change_prompt_mode = QComboBox()
+        self.change_prompt_mode.setToolTip(_("tip_dict_prompt_mode"))
         for _pm_val, _pm_key in (
             ('不修改', 'dict_prompt_mode_no'),
             ('追加', 'dict_prompt_mode_append'),
@@ -1818,29 +2965,44 @@ class MainWindow(QMainWindow):
             self.change_prompt_mode.setCurrentIndex(_default_pm_idx)
         self.dict_layout.addWidget(self.change_prompt_mode)
 
-        self.addSubInterface(self.dict_tab, FluentIcon.SETTING, _("tab_dict"), NavigationItemPosition.TOP)
-        
     def initSettingsTab(self):
         self.settings_tab = Widget("Settings", self)
         self.settings_layout = self.settings_tab.vBoxLayout
         
         # CrispASR Section
+        self.settings_asr_backend_label = BodyLabel(_("settings_asr_backend_label"))
+        self.settings_asr_backend_label.setToolTip(_("tip_settings_asr_backend"))
+        self.settings_layout.addWidget(self.settings_asr_backend_label)
+        self.asr_backend = QComboBox()
+        self.asr_backend.addItems(_list_crispasr_backends())
+        self.asr_backend.setToolTip(_("tip_settings_asr_backend"))
+        default_backend_index = self.asr_backend.findText(DEFAULT_CRISPASR_BACKEND)
+        if default_backend_index >= 0:
+            self.asr_backend.setCurrentIndex(default_backend_index)
+        self.settings_layout.addWidget(self.asr_backend)
+
         self.settings_asr_model_label = BodyLabel(_("settings_asr_model_label"))
+        self.settings_asr_model_label.setToolTip(_("tip_settings_asr_model"))
         self.settings_layout.addWidget(self.settings_asr_model_label)
         self.asr_model_file = QComboBox()
-        self.asr_model_file.addItems(_list_crispasr_models() + [NO_TRANSCRIPTION])
+        self.asr_model_file.addItems(_list_crispasr_models())
+        self.asr_model_file.setToolTip(_("tip_settings_asr_model"))
         self.settings_layout.addWidget(self.asr_model_file)
 
-        self.settings_lang_label = BodyLabel(_("settings_lang_label"))
-        self.settings_layout.addWidget(self.settings_lang_label)
-        self.input_lang = QComboBox()
-        self.input_lang.addItems(['ja','en','ko','ru','fr','zh'])
-        self.settings_layout.addWidget(self.input_lang)
+        self.settings_asr_aligner_label = BodyLabel(_("settings_asr_aligner_label"))
+        self.settings_asr_aligner_label.setToolTip(_("tip_settings_asr_aligner"))
+        self.settings_layout.addWidget(self.settings_asr_aligner_label)
+        self.asr_aligner_file = QComboBox()
+        self.asr_aligner_file.addItems(_list_crispasr_aligners())
+        self.asr_aligner_file.setToolTip(_("tip_settings_asr_aligner"))
+        self.settings_layout.addWidget(self.asr_aligner_file)
 
         self.settings_asr_param_label = BodyLabel(_("settings_asr_param_label"))
+        self.settings_asr_param_label.setToolTip(_("tip_settings_asr_param"))
         self.settings_layout.addWidget(self.settings_asr_param_label)
         self.param_crispasr = QTextEdit()
         self.param_crispasr.setPlaceholderText(_("settings_asr_param_placeholder"))
+        self.param_crispasr.setToolTip(_("settings_asr_param_placeholder"))
         self.settings_layout.addWidget(self.param_crispasr)
 
         button_layout = QHBoxLayout()
@@ -1853,33 +3015,6 @@ class MainWindow(QMainWindow):
         self.refresh_speech_models_button.clicked.connect(self.refresh_speech_model_lists)
         button_layout.addWidget(self.refresh_speech_models_button)
         self.settings_layout.addLayout(button_layout)
-
-        # UVR models move into speech settings for consistency
-        self.settings_uvr_label = BodyLabel(_("settings_uvr_label"))
-        self.settings_layout.addWidget(self.settings_uvr_label)
-        self.uvr_file = QComboBox()
-        uvr_lst = [i for i in os.listdir('separate') if i.endswith('onnx')]
-        self.uvr_file.addItems(uvr_lst)
-        self.settings_layout.addWidget(self.uvr_file)
-        self.open_uvr_dir = QPushButton(_("settings_open_uvr_btn"))
-        self.open_uvr_dir.clicked.connect(lambda: open_path(os.path.join(os.getcwd(),'separate')))
-        self.settings_layout.addWidget(self.open_uvr_dir)
-
-        self.addSubInterface(self.settings_tab, FluentIcon.SETTING, _("tab_settings"), NavigationItemPosition.TOP)
-
-        # Sync transcription language between IO tab and Settings tab
-        def sync_transcription_to_settings(idx):
-            self.input_lang.blockSignals(True)
-            self.input_lang.setCurrentIndex(idx)
-            self.input_lang.blockSignals(False)
-
-        def sync_settings_to_transcription(idx):
-            self.transcription_lang.blockSignals(True)
-            self.transcription_lang.setCurrentIndex(idx)
-            self.transcription_lang.blockSignals(False)
-
-        self.transcription_lang.currentIndexChanged.connect(sync_transcription_to_settings)
-        self.input_lang.currentIndexChanged.connect(sync_settings_to_transcription)
 
     def initAdvancedSettingTab(self):
         self.advanced_settings_tab = Widget("AdvancedSettings", self)
@@ -1954,8 +3089,6 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.test_online_button)
         self.advanced_settings_layout.addLayout(button_layout)
 
-        self.addSubInterface(self.advanced_settings_tab, FluentIcon.SETTING, _("tab_advanced_settings"), NavigationItemPosition.TOP)
-
     def initClipTab(self):
         self.clip_tab = Widget("Clip", self)
         self.clip_layout = self.clip_tab.vBoxLayout
@@ -1996,6 +3129,20 @@ class MainWindow(QMainWindow):
         # Vocal Split
         self.clip_vocal_split_label = BodyLabel(_("clip_vocal_split_label"))
         self.clip_layout.addWidget(self.clip_vocal_split_label)
+        uvr_model_row = QHBoxLayout()
+        self.clip_uvr_model_label = BodyLabel(_("clip_uvr_model_label"))
+        self.clip_uvr_model_label.setToolTip(_("tip_clip_uvr_model"))
+        uvr_model_row.addWidget(self.clip_uvr_model_label)
+        self.uvr_file = QComboBox()
+        uvr_lst = [i for i in os.listdir('separate') if i.endswith('onnx')]
+        self.uvr_file.addItems(uvr_lst)
+        self.uvr_file.setToolTip(_("tip_clip_uvr_model"))
+        uvr_model_row.addWidget(self.uvr_file)
+        self.open_uvr_dir = QPushButton(_("clip_open_uvr_btn"))
+        self.open_uvr_dir.clicked.connect(lambda: open_path(os.path.join(os.getcwd(), 'separate')))
+        uvr_model_row.addWidget(self.open_uvr_dir)
+        uvr_model_row.addStretch()
+        self.clip_layout.addLayout(uvr_model_row)
         self.uvr_file_list = QTextEdit()
         self.uvr_file_list.setAcceptDrops(True)
         self._bind_drop_event(self.uvr_file_list)
@@ -2005,8 +3152,6 @@ class MainWindow(QMainWindow):
         self.run_uvr_button = QPushButton(_("clip_vocal_run_btn"))
         self.run_uvr_button.clicked.connect(self.run_vocal_split)
         self.clip_layout.addWidget(self.run_uvr_button)
-
-        self.addSubInterface(self.clip_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_clip"), NavigationItemPosition.TOP)
 
     def initSynthTab(self):
         self.synth_tab = Widget("Synth", self)
@@ -2053,6 +3198,7 @@ class MainWindow(QMainWindow):
         self.subtitle_type_combo = QComboBox()
         self.subtitle_type_combo.addItem(_("synth_sub_hard"), userData="硬字幕")
         self.subtitle_type_combo.addItem(_("synth_sub_soft"), userData="软字幕")
+        self.subtitle_type_combo.currentIndexChanged.connect(self.update_synth_font_controls)
         hbox.addWidget(self.subtitle_type_combo)
 
         self.synth_font_label = BodyLabel(_("synth_font_label"))
@@ -2080,8 +3226,6 @@ class MainWindow(QMainWindow):
         self.run_synth_audio_button.clicked.connect(self.run_synth_audio)
         self.synth_layout.addWidget(self.run_synth_audio_button)
 
-        self.addSubInterface(self.synth_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_synth"), NavigationItemPosition.TOP)
-
     def initSummarizeTab(self):
         self.summarize_tab = Widget("Summarize", self)
         self.summarize_layout = self.summarize_tab.vBoxLayout
@@ -2104,61 +3248,23 @@ class MainWindow(QMainWindow):
         self.run_summarize_button.clicked.connect(self.run_summarize)
         self.summarize_layout.addWidget(self.run_summarize_button)
 
-        self.addSubInterface(self.summarize_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_summarize"), NavigationItemPosition.TOP)
-
     def run_worker(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('run', _("task_workflow"))
 
     def run_clip(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.clip)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('clip', _("task_clip"))
 
     def run_synth(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.synth)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('synth', _("task_synth"))
 
     def run_synth_audio(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.audiosynth)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('audiosynth', _("task_audio_synth"))
 
     def run_vocal_split(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.vocal_split)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('vocal_split', _("task_vocal_split"))
 
     def run_summarize(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.summarize)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task('summarize', _("task_summarize"))
 
     def show_model_selection_dialog(self, models):
         dialog = QDialog(self)
@@ -2186,30 +3292,30 @@ class MainWindow(QMainWindow):
         ))
         cancel_btn.clicked.connect(dialog.reject)
 
-        dialog.exec_()
+        dialog.exec()
 
     def run_test_online_api(self):
-        self.thread = QThread()
-        self.worker = MainWorker(self)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.test_online_api)
-        self.worker.show_model_dialog.connect(self.show_model_selection_dialog)
-        self.worker.finished.connect(self.thread.quit)
-        self.thread.start()
-        self.switchTo(self.log_tab)
+        self._start_worker_task(
+            'test_online_api', _("task_api_test"),
+            show_model_dialog=True,
+        )
     
     def cleaner(self):
-        self._emit_status(_("status_cleaning_intermediate"))
-        if os.path.exists('project/gt_input'):
-            shutil.rmtree('project/gt_input')
-        if os.path.exists('project/gt_output'):
-            shutil.rmtree('project/gt_output')
-        if os.path.exists('project/transl_cache'):
-            shutil.rmtree('project/transl_cache')
-        self._emit_status(_("status_cleaning_output"))
-        if os.path.exists('project/cache'):
-            shutil.rmtree('project/cache')
-        os.makedirs('project/cache', exist_ok=True)
+        self._set_progress_context(_("task_clean"))
+        try:
+            self._emit_status(_("status_cleaning_intermediate"))
+            if os.path.exists('project/gt_input'):
+                shutil.rmtree('project/gt_input')
+            if os.path.exists('project/gt_output'):
+                shutil.rmtree('project/gt_output')
+            if os.path.exists('project/transl_cache'):
+                shutil.rmtree('project/transl_cache')
+            self._emit_status(_("status_cleaning_output"))
+            if os.path.exists('project/cache'):
+                shutil.rmtree('project/cache')
+            os.makedirs('project/cache', exist_ok=True)
+        finally:
+            self._on_task_finished()
 
 def error_handler(func):
     def wrapper(self):
@@ -2223,8 +3329,8 @@ def error_handler(func):
 
     return wrapper
 class MainWorker(QObject):
-    finished = pyqtSignal()
-    show_model_dialog = pyqtSignal(list)
+    finished = Signal()
+    show_model_dialog = Signal(list)
 
     def __init__(self, master):
         super().__init__()
@@ -2234,6 +3340,7 @@ class MainWorker(QObject):
         self.child_processes = []
         self._child_processes_lock = threading.Lock()
         self._proc_readers = {}
+        self._translation_pool = None
         self._stop_requested = False
         self._stop_event = asyncio.Event()
 
@@ -2318,7 +3425,7 @@ class MainWorker(QObject):
     def update_translation_config(self):
         self._emit_status(_("status_config_translating"))
         translator = self.master.translator_group.currentText()
-        language = self.master.input_lang.currentText()
+        language = self.master.transcription_lang.currentText()
         gpt_token = self.master.gpt_token.text() or _load_api_key()
         gpt_address = self.master.gpt_address.text()
         gpt_model = self.master.gpt_model.text()
@@ -2347,7 +3454,7 @@ class MainWorker(QObject):
         if 'common' not in cfg:
             cfg['common'] = {}
         target_lang = self.master.target_lang.currentData() if hasattr(self.master, 'target_lang') else 'zh-cn'
-        source_lang = self.master.input_lang.currentText() if hasattr(self.master, 'input_lang') else 'ja'
+        source_lang = self.master.transcription_lang.currentText() if hasattr(self.master, 'transcription_lang') else 'ja'
         if source_lang == 'zh':
             source_lang = 'zh-cn'
         cfg['common']['language'] = f"{source_lang}2{target_lang}"
@@ -2717,7 +3824,7 @@ class MainWorker(QObject):
             
         self.finished.emit()
 
-    def _process_single_audio(self, wav_file, asr_model_file, language, param_crispasr, json_path, start_named_proc, stop_named_proc):
+    def _process_single_audio(self, wav_file, asr_backend, asr_model_file, asr_aligner_file, language, param_crispasr, json_path, start_named_proc, stop_named_proc):
         """使用 CrispASR + forced aligner 处理单个音频文件。"""
         base_path = wav_file[:-4]  # 去掉 .wav
         intermediate_srt = base_path + '.srt'
@@ -2730,7 +3837,13 @@ class MainWorker(QObject):
         try:
             shutil.copyfile(wav_file, staged_input)
             command = _build_crispasr_command(
-                staged_input, output_base, asr_model_file, language, param_crispasr
+                staged_input,
+                output_base,
+                asr_model_file,
+                language,
+                param_crispasr,
+                aligner_file=asr_aligner_file,
+                backend=asr_backend,
             )
             self.msg_queue.put("detail", _format_command(command))
             asr_proc, _unused = start_named_proc('crispasr', command)
@@ -2834,12 +3947,14 @@ class MainWorker(QObject):
                     segment_srts_zh.append(zh_srt)
 
             if output_format in ('原文LRC', '双语LRC'):
-                orig_lrc = os.path.join(segment_dir, segment_name + '.lrc')
+                original_suffix = '.orig.lrc' if output_format == '双语LRC' else '.lrc'
+                orig_lrc = os.path.join(segment_dir, segment_name + original_suffix)
                 if os.path.exists(orig_lrc):
                     segment_lrcs_orig.append(orig_lrc)
 
             if output_format in ('目标LRC', '双语LRC'):
-                zh_lrc = os.path.join(segment_dir, segment_name + '.zh.lrc')
+                target_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+                zh_lrc = os.path.join(segment_dir, segment_name + target_suffix)
                 if os.path.exists(zh_lrc):
                     segment_lrcs_zh.append(zh_lrc)
 
@@ -2866,7 +3981,8 @@ class MainWorker(QObject):
             merge_lrc_files(segment_lrcs_orig, final_lrc, duration)
 
         if output_format in ('目标LRC', '双语LRC'):
-            final_zh_lrc = os.path.join(final_output_dir, base_name + '.zh.lrc')
+            target_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+            final_zh_lrc = os.path.join(final_output_dir, base_name + target_suffix)
             merge_lrc_files(segment_lrcs_zh, final_zh_lrc, duration)
 
         if output_format == '双语LRC':
@@ -2886,9 +4002,11 @@ class MainWorker(QObject):
         
         self.save_config()
         input_files = self.master.input_files_list.toPlainText()
+        asr_backend = self.master.asr_backend.currentText()
         asr_model_file = self.master.asr_model_file.currentText()
+        asr_aligner_file = self.master.asr_aligner_file.currentText()
         translator = self.master.translator_group.currentText()
-        language = self.master.input_lang.currentText()
+        language = self.master.transcription_lang.currentText()
         sakura_file = self.master.sakura_file.currentText()
         sakura_mode = self.master.sakura_mode.text()
         proxy_address = self.master.proxy_address.text()
@@ -2897,7 +4015,9 @@ class MainWorker(QObject):
         after_dict = self.master.after_dict.toPlainText()
         param_crispasr = self.master.param_crispasr.toPlainText()
         param_llama = self.master.param_llama.toPlainText()
-        output_format = self.master.output_format.currentData()
+        enable_transcription = self.master.enable_transcription_checkbox.isChecked()
+        need_translate = self.master.enable_translation_checkbox.isChecked()
+        output_format = self.master.selected_output_format(need_translate)
         output_dir = self.master.output_dir_edit.text().strip() or self.master.default_output_dir()
         use_input_dir = self.master.use_input_dir_checkbox.isChecked()
         enable_segment = self.master.enable_segment_checkbox.isChecked()
@@ -2944,14 +4064,13 @@ class MainWorker(QObject):
 
         os.makedirs('project/cache', exist_ok=True)
 
-        # 统一刷新翻译配置
-        self.update_translation_config()
+        # Only prepare translation configuration when that stage is enabled.
+        if need_translate:
+            self.update_translation_config()
 
         target_lang = self.master.target_lang.currentData() if hasattr(self.master, 'target_lang') else 'zh-cn'
-        need_translate = translator != '不进行翻译'
         if not need_translate:
-            if translator == '不进行翻译':
-                self._emit_status(_("status_no_translator_skip"))
+            self._emit_status(_("status_no_translator_skip"))
 
         engine = 'ForGal-json'
         if need_translate and 'sakura' in translator:
@@ -2998,15 +4117,16 @@ class MainWorker(QObject):
         # 同步详细日志模式设置到翻译线程池
         ConcurrentTranslationPool.verbose_galtransl = self.master.verbose_checkbox.isChecked()
 
-        self._translation_pool = ConcurrentTranslationPool(
-            project_dir='project',
-            base_config_path='project/config.yaml',
-            max_concurrent=max_concurrent,
-            stop_event=self._stop_event,
-            msg_queue=self.msg_queue,
-            local_model_config=local_model_config,
-        )
-        self._translation_pool.start(engine)
+        if need_translate:
+            self._translation_pool = ConcurrentTranslationPool(
+                project_dir='project',
+                base_config_path='project/config.yaml',
+                max_concurrent=max_concurrent,
+                stop_event=self._stop_event,
+                msg_queue=self.msg_queue,
+                local_model_config=local_model_config,
+            )
+            self._translation_pool.start(engine)
 
         # 主线程：顺序执行下载+听写，产出放入队列
         for idx, input_file in enumerate(input_files):
@@ -3087,8 +4207,12 @@ class MainWorker(QObject):
                 except Exception:
                     pass
                 # 原文 LRC（双语 LRC 需要）
-                if output_format == '双语LRC':
-                    lrc_output = os.path.join(current_output_dir, os.path.basename(input_file[:-4] + '.orig.lrc'))
+                if output_format in ('原文LRC', '双语LRC'):
+                    lrc_suffix = '.orig.lrc' if output_format == '双语LRC' else '.lrc'
+                    lrc_output = os.path.join(
+                        current_output_dir,
+                        os.path.basename(input_file[:-4] + lrc_suffix),
+                    )
                     make_lrc(json_path, lrc_output)
                 base_path = input_file[:-4]  # 去掉 .srt
                 tf = TranscribedFile(
@@ -3100,7 +4224,7 @@ class MainWorker(QObject):
                 )
             else:
                 # 音视频输入：提取音频 → 听写（如果已有srt则跳过）
-                if asr_model_file == NO_TRANSCRIPTION:
+                if not enable_transcription:
                     self._emit_status(_("status_no_transcribe_skip"))
                     continue
 
@@ -3141,6 +4265,7 @@ class MainWorker(QObject):
                         )
                         self._translation_pool.submit(tf)
                         continue
+                    continue
 
                 self._emit_status(_("status_extracting_audio"))
                 ffmpeg_proc, _unused = start_named_proc(
@@ -3190,13 +4315,19 @@ class MainWorker(QObject):
                         segment_json = os.path.join(transcribed_dir, segment_name + '.json')
                         self._process_single_audio(
                             segment_file,
+                            asr_backend,
                             asr_model_file,
+                            asr_aligner_file,
                             language,
                             param_crispasr,
                             segment_json,
                             start_named_proc,
                             stop_named_proc,
                         )
+
+                        if output_format in ('原文LRC', '双语LRC'):
+                            lrc_suffix = '.orig.lrc' if output_format == '双语LRC' else '.lrc'
+                            make_lrc(segment_json, segment_base + lrc_suffix)
 
                         # 立即提交该分段进行翻译
                         if need_translate:
@@ -3230,7 +4361,9 @@ class MainWorker(QObject):
                     self._emit_status(_("status_asr_in_progress"))
                     self._process_single_audio(
                         wav_file,
+                        asr_backend,
                         asr_model_file,
+                        asr_aligner_file,
                         language,
                         param_crispasr,
                         json_path,
@@ -3264,16 +4397,17 @@ class MainWorker(QObject):
                         orig_srt_path='',
                     )
 
-            if tf is not None:
+            if tf is not None and need_translate:
                 self._translation_pool.submit(tf)
 
         # 发送哨兵，等待翻译线程结束
         self._emit_status(_("status_all_transcribed"))
-        self._translation_pool.done()
-        self._translation_pool.wait_all(timeout=600)
-        self._translation_pool.stop()
+        if self._translation_pool:
+            self._translation_pool.done()
+            self._translation_pool.wait_all(timeout=600)
+            self._translation_pool.stop()
 
-        err_count = self._translation_pool.error_count
+        err_count = self._translation_pool.error_count if self._translation_pool else 0
         if err_count > 0:
             self._emit_status(_("status_translate_fail_count", count=err_count))
 
@@ -3286,8 +4420,7 @@ class MainWorker(QObject):
 
 if __name__ == "__main__":
     os.makedirs('project/cache', exist_ok=True)
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
     app = QApplication(sys.argv)
     main_window = MainWindow()
     main_window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

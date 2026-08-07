@@ -12,7 +12,8 @@ gradio
 yt-dlp
 pysrt
 bilibili-dl
-PyQt-Fluent-Widgets
+PySide6
+qt-material
 pyinstaller
 openai
 torch

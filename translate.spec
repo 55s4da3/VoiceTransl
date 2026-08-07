@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'onnxruntime', 'PyQt-Fluent-Widgets','PyQt5'],
+    excludes=['torch', 'onnxruntime'],
     noarchive=False,
     optimize=0,
 )
