@@ -6,6 +6,8 @@
 <h1><p align='center' >VoiceTransl 灵译</p></h1>
 <div align=center><img src="https://img.shields.io/github/v/release/shinnpuru/VoiceTransl"/>   <img src="https://img.shields.io/github/license/shinnpuru/VoiceTransl"/>   <img src="https://img.shields.io/github/stars/shinnpuru/VoiceTransl"/></div>
 
+**简体中文** | [English](README_EN.md)
+
 VoiceTransl是一站式离线AI视频字幕生成和翻译软件，支持Mac和Windows。从视频下载，音频提取，听写打轴，字幕翻译，视频合成，字幕总结各个环节为翻译者提供便利。本项目基于[Galtransl](https://github.com/xd2333/GalTransl)，采用GPLv3许可。
 
 ## 特色
@@ -48,7 +50,7 @@ VoiceTransl是一站式离线AI视频字幕生成和翻译软件，支持Mac和W
 
 ## 使用说明
 
-使用说明请见 [视频教程](https://www.bilibili.com/video/BV1koZ6YuE1x)或者[Wiki说明](https://github.com/shinnpuru/VoiceTransl/wiki)。
+使用说明请见 [视频教程](https://www.bilibili.com/video/BV1koZ6YuE1x)。
 
 ## 声明
 
