@@ -639,6 +639,7 @@ class BaseTranslate:
                 is_stream=stream if stream != NOT_GIVEN else token.stream
                 self._last_chatbot_was_stream = bool(is_stream)
                 self._last_chatbot_model_name = getattr(token, "model_name", "")
+                self._last_chatbot_finish_reason = None
                 LOGGER.debug(f"Call {token.domain} withs token {token.maskToken()}")
 
                 await self._wait_for_global_rpm_slot()
@@ -689,6 +690,7 @@ class BaseTranslate:
                     stream_abort_requested = False
                     stream_line_buffer = ""
                     stream_completed = False
+                    stream_finish_reason = None
                     try:
                         async for chunk in response:
                             # Check stop in the middle of streaming so we don't
@@ -699,6 +701,8 @@ class BaseTranslate:
                                 raise JobCancelledError()
                             if not chunk.choices:
                                 continue
+                            if chunk.choices[0].finish_reason:
+                                stream_finish_reason = chunk.choices[0].finish_reason
                             if hasattr(chunk.choices[0].delta, "reasoning_content"):
                                 lastline = lastline + (
                                     chunk.choices[0].delta.reasoning_content or ""
@@ -736,6 +740,7 @@ class BaseTranslate:
                                     stream_abort_requested = True
                             except Exception:
                                 pass
+                        self._last_chatbot_finish_reason = stream_finish_reason
                     finally:
                         if not stream_completed or stream_abort_requested:
                             close_stream = getattr(response, "aclose", None)
@@ -747,6 +752,7 @@ class BaseTranslate:
                 else:
                     try:
                         result = response.choices[0].message.content
+                        self._last_chatbot_finish_reason = response.choices[0].finish_reason
                     except:
                         raise ValueError(
                             "response.choices[0].message.content is None, no_candidates"

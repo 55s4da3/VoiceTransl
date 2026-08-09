@@ -708,17 +708,21 @@ async def doLLMTranslSingleChunk(
                     eng_type=eng_type,
                 )
                 if proofread_unhit:
+                    # 有任一句尚未校对时，将当前文件（或文件分片）整体放入
+                    # 同一个请求，便于模型统一检查上下文、漏译和格式。若响应
+                    # 截断或解析失败，后端 smartRetry 仍会自动拆分重试。
+                    proofread_request_size = len(split_chunk.trans_list)
                     await gptapi.batch_translate(
                         file_name,
                         cache_file_path,
                         split_chunk.trans_list,
-                        projectConfig.getKey("gpt.numPerRequestProofRead"),
+                        proofread_request_size,
                         retry_failed=projectConfig.getKey("retranslFail"),
                         gpt_dic=gpt_dic,
                         proofread=True,
                         retran_key=projectConfig.getKey("retranslKey"),
                         translist_hit=proofread_hit,
-                        translist_unhit=proofread_unhit,
+                        translist_unhit=split_chunk.trans_list,
                     )
             else:
                 LOGGER.warning("当前引擎不支持校对，跳过校对步骤")

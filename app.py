@@ -7,6 +7,20 @@ _TRANSLATE_CMD = ['translate/translate'] if _FROZEN else [sys.executable, 'trans
 _SEPARATE_CMD = ['separate/separate'] if _FROZEN else [sys.executable, 'separate.py']
 import shutil
 from i18n import _, set_language, get_language
+
+# Windows 下如果先加载 PyQt，再由工作线程首次导入 CTranslate2，
+# CTranslate2 对 PyTorch 的可选探测可能导致 c10.dll 初始化失败
+#（WinError 1114）。在 Qt 加载前完成依赖初始化，后续工作线程只需
+# 复用已加载模块。预加载失败时仍允许 GUI 启动，并由任务日志报告原错误。
+_STREAMING_PRELOAD_ERROR = None
+if not _FROZEN:
+    try:
+        from streaming_pipeline import _activate_cuda_dll_dirs
+        _activate_cuda_dll_dirs()
+        import faster_whisper as _faster_whisper_preloaded
+    except Exception as _streaming_preload_exc:
+        _STREAMING_PRELOAD_ERROR = _streaming_preload_exc
+
 from PyQt5 import QtGui, QtCore
 from PyQt5.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer, QDateTime, QSize
 from PyQt5.QtWidgets import QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu, QAction, QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget
@@ -932,6 +946,7 @@ class MainWindow(QMainWindow):
         enable_segment = self.enable_segment_checkbox.isChecked()
         segment_duration = self.segment_duration_spin.value()
         enable_streaming = self.streaming_checkbox.isChecked() if hasattr(self, 'streaming_checkbox') else False
+        enable_proofread = self.proofread_checkbox.isChecked() if hasattr(self, 'proofread_checkbox') else False
         change_prompt_mode = self.change_prompt_mode.currentData() if hasattr(self, 'change_prompt_mode') else '不修改'
         auto_shutdown = self.auto_shutdown_checkbox.isChecked() if hasattr(self, 'auto_shutdown_checkbox') else False
         target_translation_lang = self.target_lang.currentData() if hasattr(self, 'target_lang') else 'zh-cn'
@@ -965,6 +980,7 @@ class MainWindow(QMainWindow):
             'enable_segment': enable_segment,
             'segment_duration': segment_duration,
             'enable_streaming': enable_streaming,
+            'enable_proofread': enable_proofread,
             'change_prompt_mode': change_prompt_mode,
             'log_level_filter': self.log_filter_combo.currentText(),
             'verbose_mode': self.verbose_checkbox.isChecked(),
@@ -1326,6 +1342,8 @@ class MainWindow(QMainWindow):
             self.segment_duration_spin.setValue(gui_settings.get('segment_duration', 10))
             if hasattr(self, 'streaming_checkbox'):
                 self.streaming_checkbox.setChecked(gui_settings.get('enable_streaming', False))
+            if hasattr(self, 'proofread_checkbox') and 'enable_proofread' in gui_settings:
+                self.proofread_checkbox.setChecked(bool(gui_settings['enable_proofread']))
             change_prompt_mode = gui_settings.get('change_prompt_mode', '')
             if hasattr(self, 'change_prompt_mode') and change_prompt_mode:
                 _pm_idx = self.change_prompt_mode.findData(change_prompt_mode)
@@ -1428,6 +1446,10 @@ class MainWindow(QMainWindow):
                 with open('project/config.yaml', 'r', encoding='utf-8') as f:
                     cfg = yaml.safe_load(f) or {}
                 common_cfg = cfg.get('common', {})
+
+                # 兼容尚未保存 GUI 开关的旧配置：首次加载时沿用 config.yaml。
+                if hasattr(self, 'proofread_checkbox') and 'enable_proofread' not in gui_settings:
+                    self.proofread_checkbox.setChecked(bool(common_cfg.get('gpt.enableProofRead', False)))
 
                 change_prompt_val = common_cfg.get('gpt.change_prompt', 'no')
                 mode_reverse_mapping = {
@@ -1759,6 +1781,9 @@ class MainWindow(QMainWindow):
         segment_layout = QHBoxLayout()
         self.streaming_checkbox = QCheckBox(_("io_streaming_checkbox"))
         segment_layout.addWidget(self.streaming_checkbox)
+        self.proofread_checkbox = QCheckBox(_("io_proofread_checkbox"))
+        self.proofread_checkbox.setToolTip(_("io_proofread_tooltip"))
+        segment_layout.addWidget(self.proofread_checkbox)
         self.enable_segment_checkbox = QCheckBox(_("io_segment_checkbox"))
         self.enable_segment_checkbox.stateChanged.connect(self.update_segment_controls)
         segment_layout.addWidget(self.enable_segment_checkbox)
@@ -2473,6 +2498,11 @@ class MainWorker(QObject):
         if source_lang == 'zh':
             source_lang = 'zh-cn'
         cfg['common']['language'] = f"{source_lang}2{target_lang}"
+        cfg['common']['gpt.enableProofRead'] = (
+            self.master.proofread_checkbox.isChecked()
+            if hasattr(self.master, 'proofread_checkbox')
+            else False
+        )
 
         # Update backendSpecific configuration
         if 'backendSpecific' not in cfg:

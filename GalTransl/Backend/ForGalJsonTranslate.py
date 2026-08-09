@@ -29,9 +29,21 @@ from openai._types import NOT_GIVEN
 
 class ForGalJsonTranslate(BaseTranslate):
     _SIGCHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+    _DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 384000
 
     def _encode_sig_jsonline(self, sig: str, obj: dict) -> str:
         return f"{sig}|" + json.dumps(obj, ensure_ascii=False)
+
+    def _get_proofread_max_tokens(self, proofread: bool):
+        """官方 DeepSeek V4 全量校对显式请求模型支持的最大输出。"""
+        if not proofread:
+            return NOT_GIVEN
+        for _client, token in getattr(self, "client_list", []):
+            model_name = str(getattr(token, "model_name", "") or "").lower()
+            domain = str(getattr(token, "domain", "") or "").lower()
+            if model_name.startswith("deepseek-v4") and "api.deepseek.com" in domain:
+                return self._DEEPSEEK_V4_MAX_OUTPUT_TOKENS
+        return NOT_GIVEN
 
     # init
     def __init__(
@@ -192,6 +204,7 @@ class ForGalJsonTranslate(BaseTranslate):
                 file_name=f"{filename}:{idx_tip}",
                 base_try_count=retry_count,
                 stream_line_callback=_parse_stream_lines,
+                max_tokens=self._get_proofread_max_tokens(proofread),
             )
 
             result_text = resp or ""
@@ -255,6 +268,20 @@ class ForGalJsonTranslate(BaseTranslate):
                 error_flag = False  # 部分解析
 
             if error_flag:
+                finish_reason = str(
+                    getattr(self, "_last_chatbot_finish_reason", "") or ""
+                ).lower()
+                output_was_truncated = finish_reason in {"length", "max_tokens"}
+
+                # 达到输出上限时，已通过 sig/id 严格校验的完整前缀可以直接
+                # 保存，下一轮只继续校对剩余句子，避免重复消耗同一大段 Token。
+                if output_was_truncated and success_count > 0:
+                    LOGGER.warning(
+                        f"[输出截断][{filename}:{idx_tip}]达到模型输出上限，"
+                        f"已保留前 {success_count} 句，将继续处理剩余内容"
+                    )
+                    return success_count, result_trans_list
+
                 try:
                     from GalTransl.server import record_runtime_error
                     record_runtime_error(
@@ -273,6 +300,20 @@ class ForGalJsonTranslate(BaseTranslate):
                 LOGGER.warning(
                     f"[解析错误][{filename}:{idx_tip}]解析结果出错：{error_message}"
                 )
+
+                # 一句都未能解析且服务端明确报告长度上限时，立即缩小请求，
+                # 不再原样重试两次。
+                if output_was_truncated and len(trans_list) > 1 and self.smartRetry:
+                    LOGGER.warning(
+                        f"[输出截断][{filename}:{idx_tip}]未得到完整句，立即拆分重试"
+                    )
+                    return await self.translate(
+                        trans_list[: max(len(trans_list) // 3, 1)],
+                        gptdict,
+                        proofread=proofread,
+                        filename=filename,
+                    )
+
                 retry_count += 1
                 self._check_stop_requested()
                 await asyncio.sleep(1)

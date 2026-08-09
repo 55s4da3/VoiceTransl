@@ -190,25 +190,22 @@ class _IncrementalTranslator:
                 and self.sentences
                 and config.getKey("gpt.enableProofRead")
             ):
-                self.status("[STREAM] ASR 已完成，正在进行 Pro 二次校对...")
-                for start in range(0, len(self.sentences), self.batch_size):
-                    if self.stop_event.is_set():
-                        break
-                    batch = self.sentences[start : start + self.batch_size]
-                    loop.run_until_complete(
-                        api.batch_translate(
-                            "stream-proofread",
-                            self.cache_path,
-                            batch,
-                            self.batch_size,
-                            proofread=True,
-                            translist_unhit=batch,
-                        )
+                sentence_count = len(self.sentences)
+                self.status(
+                    f"[STREAM] ASR 已完成，正在一次性提交全部 {sentence_count} 句进行校对..."
+                )
+                loop.run_until_complete(
+                    api.batch_translate(
+                        "stream-proofread",
+                        self.cache_path,
+                        self.sentences,
+                        sentence_count,
+                        proofread=True,
+                        translist_unhit=self.sentences,
                     )
-                    self._write_translated_checkpoint()
-                    self.status(
-                        f"[STREAM] 已校对 {min(start + len(batch), len(self.sentences))}/{len(self.sentences)} 句"
-                    )
+                )
+                self._write_translated_checkpoint()
+                self.status(f"[STREAM] 已校对 {sentence_count}/{sentence_count} 句")
         except BaseException as exc:
             self.error = exc
         finally:
