@@ -117,7 +117,11 @@ class ForGalJsonTranslate(BaseTranslate):
 
         self.restore_context(trans_list, self.contextNum, filename)
 
-        prompt_template = self._build_prompt_request(input_src, gptdict)
+        prompt_template = self._build_prompt_request(
+            input_src,
+            gptdict,
+            prompt_template=DEEPSEEK_PROOFREAD_PROMPT if proofread else None,
+        )
 
         retry_count = 0
         emitted_success_indices = set()
@@ -162,7 +166,8 @@ class ForGalJsonTranslate(BaseTranslate):
                             stream_cursor["started"] = True
                         else:
                             continue
-                    line = fix_quotes(line)
+                    if not proofread:
+                        line = fix_quotes(line)
                     parse_ok, parse_error = self._parse_jsonline_result_line(
                         line,
                         trans_list,
@@ -200,7 +205,8 @@ class ForGalJsonTranslate(BaseTranslate):
             sig_start = re.search(r"\b[a-z0-9]{3}\|\{\"id\"", result_text)
             if sig_start:
                 result_text = result_text[sig_start.start() :]
-            result_text = fix_quotes(result_text)
+            if not proofread:
+                result_text = fix_quotes(result_text)
 
             i = -1
             success_count = 0
@@ -358,6 +364,15 @@ class ForGalJsonTranslate(BaseTranslate):
         if line_id != trans_list[i].index:
             return False, f"{line_id}句id未对应{trans_list[i].index}"
 
+        # 部分 OpenAI 兼容模型在校对时仍使用 dst，而不是提示要求的
+        # newdst。两者语义在此处相同，兼容该返回可避免整批拆分重试。
+        if (
+            key_name == "newdst"
+            and key_name not in line_json
+            and type(line_json.get("dst")) is str
+        ):
+            line_json[key_name] = line_json["dst"]
+
         if key_name not in line_json or type(line_json[key_name]) != str:
             return False, f"第{trans_list[i].index}句找不到{key_name}"
 
@@ -381,6 +396,7 @@ class ForGalJsonTranslate(BaseTranslate):
             emit_runtime_success=emit_runtime_success,
             emitted_success_indices=emitted_success_indices,
             result_index=i,
+            proofread=(key_name == "newdst"),
         )
 
     async def batch_translate(

@@ -134,10 +134,10 @@ class UIMessageQueue:
             except queue.Full:
                 pass  # 极端情况：忽略
 
-    def drain(self) -> list[tuple[str, str]]:
-        """非阻塞地取出当前队列中所有消息。"""
+    def drain(self, max_items: int | None = None) -> list[tuple[str, str]]:
+        """非阻塞地取出消息；可限制单次数量，避免 GUI 被日志淹没。"""
         entries: list[tuple[str, str]] = []
-        while True:
+        while max_items is None or len(entries) < max_items:
             try:
                 entries.append(self._queue.get_nowait())
             except queue.Empty:
@@ -652,14 +652,19 @@ class ConcurrentTranslationPool:
         for _unused in range(self._max_concurrent):
             self._task_queue.put(None)
 
-    def wait_all(self, timeout=600):
-        """等待所有工作线程结束"""
+    def wait_all(self):
+        """等待所有工作线程结束，除非用户主动取消。"""
         if self._serial_mode:
             return
 
-        # 等待所有线程结束
-        for t in self._active_threads:
-            t.join(timeout=timeout / len(self._active_threads) if self._active_threads else timeout)
+        # 大文件翻译可能持续数小时，不能把固定总超时平均给所有线程。
+        # 短轮询可以等待真实任务完成，同时及时响应用户取消。
+        while True:
+            alive_threads = [t for t in self._active_threads if t.is_alive()]
+            if not alive_threads or self._stop_event.is_set():
+                break
+            for t in alive_threads:
+                t.join(timeout=0.2)
 
         # 处理结果队列中的错误
         while True:
@@ -926,6 +931,7 @@ class MainWindow(QMainWindow):
         os.makedirs(output_dir, exist_ok=True)
         enable_segment = self.enable_segment_checkbox.isChecked()
         segment_duration = self.segment_duration_spin.value()
+        enable_streaming = self.streaming_checkbox.isChecked() if hasattr(self, 'streaming_checkbox') else False
         change_prompt_mode = self.change_prompt_mode.currentData() if hasattr(self, 'change_prompt_mode') else '不修改'
         auto_shutdown = self.auto_shutdown_checkbox.isChecked() if hasattr(self, 'auto_shutdown_checkbox') else False
         target_translation_lang = self.target_lang.currentData() if hasattr(self, 'target_lang') else 'zh-cn'
@@ -958,6 +964,7 @@ class MainWindow(QMainWindow):
             'max_concurrent': self.max_concurrent_spin.value(),
             'enable_segment': enable_segment,
             'segment_duration': segment_duration,
+            'enable_streaming': enable_streaming,
             'change_prompt_mode': change_prompt_mode,
             'log_level_filter': self.log_filter_combo.currentText(),
             'verbose_mode': self.verbose_checkbox.isChecked(),
@@ -1317,6 +1324,8 @@ class MainWindow(QMainWindow):
             self.max_concurrent_spin.setValue(gui_settings.get('max_concurrent', 1))
             self.enable_segment_checkbox.setChecked(gui_settings.get('enable_segment', False))
             self.segment_duration_spin.setValue(gui_settings.get('segment_duration', 10))
+            if hasattr(self, 'streaming_checkbox'):
+                self.streaming_checkbox.setChecked(gui_settings.get('enable_streaming', False))
             change_prompt_mode = gui_settings.get('change_prompt_mode', '')
             if hasattr(self, 'change_prompt_mode') and change_prompt_mode:
                 _pm_idx = self.change_prompt_mode.findData(change_prompt_mode)
@@ -1443,7 +1452,7 @@ class MainWindow(QMainWindow):
     def setup_timer(self):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._consume_messages)
-        self.timer.start(1000)
+        self.timer.start(200)
 
     def init_system_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1480,24 +1489,31 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'msg_queue'):
             return
 
-        entries = self.msg_queue.drain()
+        entries = self.msg_queue.drain(max_items=500)
         if not entries:
             return
 
+        status_lines = []
+        detail_lines = []
         for target, text in entries:
             if UIMessageQueue.is_completion_entry(target):
                 # 完成哨兵：两个框都追加
                 completion_msg = _("status_all_done")
-                self.output_text_edit.append(completion_msg)
-                self.log_display.appendPlainText(completion_msg)
+                status_lines.append(completion_msg)
+                detail_lines.append(completion_msg)
             elif target == 'status':
-                self.output_text_edit.append(text)
+                status_lines.append(text)
             elif target == 'detail':
                 # 应用日志级别过滤
                 if self._log_level_filter != 'ALL':
                     if not _line_passes_filter(text, self._log_level_filter):
                         continue
-                self.log_display.appendPlainText(text)
+                detail_lines.append(text)
+
+        if status_lines:
+            self.output_text_edit.append('\n'.join(status_lines))
+        if detail_lines:
+            self.log_display.appendPlainText('\n'.join(detail_lines))
 
         # 自动滚动两个框到底部
         for widget in (self.output_text_edit, self.log_display):
@@ -1578,6 +1594,7 @@ class MainWindow(QMainWindow):
 
         self.output_text_edit = QTextEdit()
         self.output_text_edit.setReadOnly(True)
+        self.output_text_edit.document().setMaximumBlockCount(1000)
         self.output_text_edit.setPlaceholderText(_("log_realtime_placeholder"))
         self.log_layout.addWidget(self.output_text_edit)
 
@@ -1605,6 +1622,7 @@ class MainWindow(QMainWindow):
         # log
         self.log_display = QPlainTextEdit(self)
         self.log_display.setReadOnly(True)
+        self.log_display.document().setMaximumBlockCount(10000)
         self.log_display.setStyleSheet("font-family: Consolas, Monospace; font-size: 10pt;")
         self.log_layout.addWidget(self.log_display)
 
@@ -1739,6 +1757,8 @@ class MainWindow(QMainWindow):
 
         # Segment Section
         segment_layout = QHBoxLayout()
+        self.streaming_checkbox = QCheckBox(_("io_streaming_checkbox"))
+        segment_layout.addWidget(self.streaming_checkbox)
         self.enable_segment_checkbox = QCheckBox(_("io_segment_checkbox"))
         self.enable_segment_checkbox.stateChanged.connect(self.update_segment_controls)
         segment_layout.addWidget(self.enable_segment_checkbox)
@@ -1956,6 +1976,7 @@ class MainWindow(QMainWindow):
         self.settings_uvr_label = BodyLabel(_("settings_uvr_label"))
         self.settings_layout.addWidget(self.settings_uvr_label)
         self.uvr_file = QComboBox()
+        os.makedirs('separate', exist_ok=True)
         uvr_lst = [i for i in os.listdir('separate') if i.endswith('onnx')]
         self.uvr_file.addItems(uvr_lst)
         self.settings_layout.addWidget(self.uvr_file)
@@ -2497,6 +2518,12 @@ class MainWorker(QObject):
             openai_cfg['stream'] = True
             openai_cfg['apiTimeout'] = 120
             openai_cfg['apiErrorWait'] = "auto"
+            # DeepSeek V4 默认思考会显著拖慢批量字幕翻译并消耗大量 token。
+            # 对其他兼容接口沿用服务端默认，避免发送不支持的扩展字段。
+            if 'api.deepseek.com' in endpoint.lower() and model.lower().startswith('deepseek-v4'):
+                openai_cfg['thinkingMode'] = 'disabled'
+            else:
+                openai_cfg['thinkingMode'] = 'auto'
 
         # Update proxy configuration
         if 'proxy' not in cfg:
@@ -2876,6 +2903,89 @@ class MainWorker(QObject):
             self._emit_status(_("status_asrlabs_error", error=e))
             raise
 
+    def _process_streaming_audio(
+        self,
+        wav_file,
+        language,
+        json_path,
+        base_path,
+        output_dir,
+        output_format,
+    ):
+        """Faster-Whisper 逐段产出并与在线翻译重叠执行。"""
+        from streaming_pipeline import run_streaming_pipeline
+
+        asr_model = self.master.asr_model_combo.currentData() or ''
+        asr_device = self.master.asr_device_combo.currentText()
+        asr_compute_type = self.master.asr_compute_type_combo.currentText()
+        asr_extra = self.master.asr_extra_edit.toPlainText()
+
+        with open('project/config.yaml', 'r', encoding='utf-8') as f:
+            project_config = yaml.safe_load(f) or {}
+        common_config = project_config.get('common', {})
+        batch_size = int(common_config.get('streaming.batchSize', 8) or 8)
+
+        workspace_name = re.sub(r'[^a-zA-Z0-9._-]+', '_', os.path.basename(base_path))
+        workspace = os.path.abspath(os.path.join('project', 'cache', 'streaming', workspace_name))
+        os.makedirs(workspace, exist_ok=True)
+        translated_json = os.path.join(workspace, 'translated.json')
+        cache_path = os.path.join(workspace, 'translation_cache.json')
+
+        self._emit_status(_("status_streaming_start"))
+        result = run_streaming_pipeline(
+            audio_path=wav_file,
+            model_path=asr_model,
+            language=language,
+            device=asr_device,
+            compute_type=asr_compute_type,
+            asr_extra=asr_extra,
+            config_dir='project',
+            source_json=json_path,
+            translated_json=translated_json,
+            cache_path=cache_path,
+            batch_size=batch_size,
+            stop_event=self._stop_event,
+            status=self._emit_status,
+        )
+
+        base_name = os.path.basename(base_path)
+        if output_format in ('原文SRT', '双语SRT'):
+            make_srt(json_path, os.path.join(output_dir, base_name + '.srt'))
+        if output_format in ('目标SRT', '双语SRT'):
+            make_srt(translated_json, os.path.join(output_dir, base_name + '.tg.srt'))
+        if output_format == '双语SRT':
+            merge_srt_files(
+                [
+                    os.path.join(output_dir, base_name + '.srt'),
+                    os.path.join(output_dir, base_name + '.tg.srt'),
+                ],
+                os.path.join(output_dir, base_name + '.combine.srt'),
+            )
+
+        if output_format == '原文LRC':
+            make_lrc(json_path, os.path.join(output_dir, base_name + '.lrc'))
+        elif output_format == '目标LRC':
+            make_lrc(translated_json, os.path.join(output_dir, base_name + '.lrc'))
+        elif output_format == '双语LRC':
+            original_lrc = os.path.join(output_dir, base_name + '.orig.lrc')
+            translated_lrc = os.path.join(output_dir, base_name + '.zh.lrc')
+            make_lrc(json_path, original_lrc)
+            make_lrc(translated_json, translated_lrc)
+            merge_lrc_files(
+                [original_lrc, translated_lrc],
+                os.path.join(output_dir, base_name + '.combine.lrc'),
+            )
+
+        self._emit_status(_(
+            "status_streaming_done",
+            count=result.segment_count,
+            asr=result.asr_seconds,
+            first=result.first_translation_seconds or 0.0,
+            overlap=result.translated_before_asr_done,
+            total=result.total_seconds,
+        ))
+        return result
+
     def _get_audio_duration(self, audio_file):
         """获取音频文件时长（秒）"""
         try:
@@ -3025,6 +3135,7 @@ class MainWorker(QObject):
         use_input_dir = self.master.use_input_dir_checkbox.isChecked()
         enable_segment = self.master.enable_segment_checkbox.isChecked()
         segment_duration_minutes = self.master.segment_duration_spin.value() if enable_segment else 0
+        enable_streaming = self.master.streaming_checkbox.isChecked() if hasattr(self.master, 'streaming_checkbox') else False
 
         with open('llama/param.txt', 'w', encoding='utf-8') as f:
             f.write(param_llama)
@@ -3281,6 +3392,28 @@ class MainWorker(QObject):
                 total_duration = self._get_audio_duration(wav_file)
                 threshold_seconds = segment_duration_minutes * 60
 
+                align_engine = self.master.align_engine_combo.currentData() or 'none'
+                if (
+                    enable_streaming
+                    and need_translate
+                    and asr_engine == 'faster-whisper'
+                    and align_engine == 'none'
+                ):
+                    self._process_streaming_audio(
+                        wav_file,
+                        language,
+                        json_path,
+                        base_path,
+                        current_output_dir,
+                        output_format,
+                    )
+                    if os.path.exists(wav_file):
+                        os.remove(wav_file)
+                    tf = None
+                    continue
+                elif enable_streaming:
+                    self._emit_status(_("status_streaming_fallback"))
+
                 if enable_segment and segment_duration_minutes > 0 and total_duration > threshold_seconds:
                     # 需要分段处理
                     self._emit_status(_("status_segment_threshold", duration=total_duration, threshold=threshold_seconds))
@@ -3331,7 +3464,7 @@ class MainWorker(QObject):
                     if need_translate and segment_tfs:
                         self._emit_status(_("status_wait_segments"))
                         self._translation_pool.done()
-                        self._translation_pool.wait_all(timeout=600)
+                        self._translation_pool.wait_all()
 
                     # 合并所有片段的翻译结果
                     self._emit_status(_("status_merge_segments"))
@@ -3378,7 +3511,7 @@ class MainWorker(QObject):
         # 发送哨兵，等待翻译线程结束
         self._emit_status(_("status_all_transcribed"))
         self._translation_pool.done()
-        self._translation_pool.wait_all(timeout=600)
+        self._translation_pool.wait_all()
         self._translation_pool.stop()
 
         err_count = self._translation_pool.error_count

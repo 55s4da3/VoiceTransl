@@ -19,6 +19,25 @@ _transcriber_cache: list[dict] | None = None
 _aligner_cache: list[dict] | None = None
 
 
+def _build_subprocess_env() -> dict[str, str] | None:
+    """让 Windows 子进程能找到虚拟环境内的 NVIDIA CUDA DLL。"""
+    if os.name != 'nt':
+        return None
+
+    env = os.environ.copy()
+    venv_root = Path(sys.executable).resolve().parent.parent
+    nvidia_root = venv_root / 'Lib' / 'site-packages' / 'nvidia'
+    dll_dirs = [
+        nvidia_root / 'cublas' / 'bin',
+        nvidia_root / 'cudnn' / 'bin',
+        nvidia_root / 'cuda_nvrtc' / 'bin',
+    ]
+    existing_dirs = [str(path) for path in dll_dirs if path.is_dir()]
+    if existing_dirs:
+        env['PATH'] = os.pathsep.join([*existing_dirs, env.get('PATH', '')])
+    return env
+
+
 def _run_asrlabs_json(args: list[str], timeout: int = 30) -> str:
     """运行 asrlabs 命令并返回 stdout 字符串
 
@@ -34,6 +53,7 @@ def _run_asrlabs_json(args: list[str], timeout: int = 30) -> str:
         [*_ASRLABS_CMD, *args],
         capture_output=True, text=True,
         timeout=timeout, creationflags=creationflags,
+        env=_build_subprocess_env(),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"asrlabs 命令失败 (exit={proc.returncode}): {proc.stderr}")
@@ -144,6 +164,7 @@ def transcribe(
     Returns:
         输出的 JSON 文件路径
     """
+    output_dir = os.path.abspath(output_dir)
     cmd = [*_ASRLABS_CMD, 'transcribe', audio_path,
            '-m', engine,
            '-l', language,
@@ -190,6 +211,7 @@ def align(
     Returns:
         对齐后的 JSON 文件路径
     """
+    output_dir = os.path.abspath(output_dir)
     cmd = [*_ASRLABS_CMD, 'align', audio_path, transcribe_json_path,
            '--aligner', aligner,
            '--device', device,
@@ -223,6 +245,7 @@ def _run_with_log(cmd, msg_queue, stop_event, output_dir, output_name) -> str:
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, creationflags=creationflags, bufsize=1,
+        env=_build_subprocess_env(),
     )
 
     # 逐行读取输出并转发到消息队列

@@ -13,6 +13,7 @@ backendSpecific:
     checkAvailable: true # 翻译前检查API是否可用[True/False]
     checkAvailableConcurrency: 4 # checkAvailable阶段的并发检测数，避免启动时瞬时打满请求。[1-16]
     globalRequestRPM: 0 # 全局跨任务请求限速（每分钟请求数）。0表示不限制。[0-60000]
+    thinkingMode: auto # 思考模式：auto沿用服务端默认，enabled开启，disabled关闭。[auto/enabled/disabled]
     stream: true # 流式请求，一般不用修改除非接口不支持流式[True/False]
     apiTimeout: 120 # 请求超时时间，单位秒
     apiErrorWait: auto # 发生API Error时的等待时间，包括频率限制。auto将自动适应[auto/0-120]
@@ -58,6 +59,9 @@ common:
     #- "残留日文" # 启动时重翻命中“残留日文”的句子
 
   gpt.contextNum: 8 # 每次请求附带的前文句数；值越大上下文更强、成本更高（常用8）。[0-32]
+  streaming.batchSize: 8 # 流式模式累计多少句立即提交翻译；较小延迟更低。[1-32]
+  gpt.enableProofRead: false # 翻译后进行第二轮独立校对，可提升准确性但增加耗时和用量。[True/False]
+  gpt.numPerRequestProofRead: 16 # 每次校对包含的句子数。[1-32]
   # ForGal/ForGal-json/ForNovel/r1
   gpt.translation_guideline: "Basic.md" # 使用的翻译规范文件名（位于translation_guidelines），会影响文风与措辞。
   gpt.enhance_jailbreak: False # 是否启用“抗拒答”增强提示，降低模型拒答概率。[True/False]

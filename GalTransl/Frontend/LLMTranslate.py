@@ -693,10 +693,21 @@ async def doLLMTranslSingleChunk(
                 translist_unhit=translist_unhit,
             )
 
-            # 执行校对（如果启用）
-            if projectConfig.getKey("gpt.enableProofRead"):
-                _check_stop_requested(projectConfig)
-                if "gpt4" in eng_type:
+        # 校对必须独立于“本轮是否有未翻译句子”执行。这样已有翻译缓存
+        # 但没有校对缓存时，也能单独补做校对。
+        if projectConfig.getKey("gpt.enableProofRead"):
+            _check_stop_requested(projectConfig)
+            proofread_engines = {"ForGal-json", "ForGal-tsv", "ForNovel", "r1"}
+            if eng_type in proofread_engines or "gpt4" in eng_type:
+                proofread_hit, proofread_unhit = await get_transCache_from_json(
+                    split_chunk.trans_list,
+                    cache_file_path,
+                    retry_failed=projectConfig.getKey("retranslFail"),
+                    proofread=True,
+                    retran_key=projectConfig.getKey("retranslKey"),
+                    eng_type=eng_type,
+                )
+                if proofread_unhit:
                     await gptapi.batch_translate(
                         file_name,
                         cache_file_path,
@@ -706,10 +717,12 @@ async def doLLMTranslSingleChunk(
                         gpt_dic=gpt_dic,
                         proofread=True,
                         retran_key=projectConfig.getKey("retranslKey"),
+                        translist_hit=proofread_hit,
+                        translist_unhit=proofread_unhit,
                     )
-                else:
-                    LOGGER.warning("当前引擎不支持校对，跳过校对步骤")
-            gptapi.clean_up()
+            else:
+                LOGGER.warning("当前引擎不支持校对，跳过校对步骤")
+        gptapi.clean_up()
 
         # 翻译后处理
         _check_stop_requested(projectConfig)

@@ -333,8 +333,9 @@ async def get_transCache_from_json(
             tran.pre_zh, tran.post_zh = "", ""
             translist_hit.append(tran)
             continue
-        # 忽略在读取缓存前pre_zh就有值的句子
-        if tran.pre_zh != "":
+        # 普通翻译读取可直接复用已有 pre_zh；校对读取还必须继续检查
+        # proofread_dst，否则同一轮刚加载出的原译文会让校对被整体跳过。
+        if tran.pre_zh != "" and not proofread:
             tran.post_zh = tran.pre_zh
             translist_hit.append(tran)
             continue
@@ -435,8 +436,10 @@ async def get_transCache_from_json(
         else:
             tran.post_zh = tran.pre_zh
 
-        # 校对模式下，未校对的
-        if proofread and tran.proofread_zh == "":
+        # 校对模式下，未校对或上次校对失败的句子都应重新进入队列。
+        if proofread and (
+            tran.proofread_zh == "" or "Fail" in str(tran.proofread_by)
+        ):
             translist_unhit.append(tran)
             continue
 

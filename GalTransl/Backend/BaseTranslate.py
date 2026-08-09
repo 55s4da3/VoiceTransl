@@ -185,6 +185,16 @@ class BaseTranslate:
             "tokenStrategy", "random"
         )
         self.stream = config.getBackendConfigSection(section_name).get("stream", True)
+        thinking_mode = str(
+            config.getBackendConfigSection(section_name).get("thinkingMode", "auto")
+        ).strip().lower()
+        if thinking_mode not in {"auto", "enabled", "disabled"}:
+            LOGGER.warning(
+                "OpenAI-Compatible.thinkingMode=%r 无效，将使用 auto",
+                thinking_mode,
+            )
+            thinking_mode = "auto"
+        self.thinking_mode = thinking_mode
 
         change_prompt = CProjectConfig.getProjectConfig(config)["common"].get(
             "gpt.change_prompt", "no"
@@ -265,8 +275,10 @@ class BaseTranslate:
             return f"{start_idx}~{end_idx}"
         return str(start_idx)
 
-    def _build_prompt_request(self, input_src: str, gptdict: str) -> str:
-        prompt_req = self.trans_prompt
+    def _build_prompt_request(
+        self, input_src: str, gptdict: str, prompt_template: str | None = None
+    ) -> str:
+        prompt_req = self.trans_prompt if prompt_template is None else prompt_template
         prompt_req = prompt_req.replace(
             "[translation_guideline]", self.pj_config.translation_guideline
         )
@@ -347,10 +359,15 @@ class BaseTranslate:
         emit_runtime_success: bool = False,
         emitted_success_indices=None,
         result_index: Optional[int] = None,
+        proofread: bool = False,
     ) -> tuple[bool, str]:
-        current_tran.pre_zh = line_dst
+        if proofread:
+            current_tran.proofread_zh = line_dst
+            current_tran.proofread_by = model_name
+        else:
+            current_tran.pre_zh = line_dst
+            current_tran.trans_by = model_name
         current_tran.post_zh = line_dst
-        current_tran.trans_by = model_name
         if emit_runtime_success:
             if emitted_success_indices is None:
                 emitted_success_indices = set()
@@ -628,18 +645,27 @@ class BaseTranslate:
 
                 # Create the API call as a task so we can cancel it if
                 # the user requests a stop while the request is in-flight.
+                request_kwargs = dict(
+                    model=token.model_name,
+                    messages=messages,
+                    stream=is_stream,
+                    temperature=temperature,
+                    frequency_penalty=frequency_penalty,
+                    max_tokens=max_tokens,
+                    timeout=self.api_timeout,
+                    top_p=top_p,
+                    reasoning_effort=reasoning_effort,
+                )
+                # DeepSeek V4 默认可能开启思考，翻译任务会因此消耗大量隐藏
+                # reasoning token。仅在配置明确指定时发送兼容参数，避免影响
+                # 不支持 thinking 字段的其他 OpenAI 兼容服务。
+                if self.thinking_mode != "auto":
+                    request_kwargs["extra_body"] = {
+                        "thinking": {"type": self.thinking_mode}
+                    }
+
                 api_task = asyncio.ensure_future(
-                    client.chat.completions.create(
-                        model=token.model_name,
-                        messages=messages,
-                        stream=is_stream,
-                        temperature=temperature,
-                        frequency_penalty=frequency_penalty,
-                        max_tokens=max_tokens,
-                        timeout=self.api_timeout,
-                        top_p=top_p,
-                        reasoning_effort=reasoning_effort,
-                    )
+                    client.chat.completions.create(**request_kwargs)
                 )
 
                 # Poll stop_event while waiting for the API response.

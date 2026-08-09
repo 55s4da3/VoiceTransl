@@ -1,5 +1,8 @@
 # ASRLabs
-asrlabs[ctc] @ git+https://github.com/MurthiNext/ASRLabs.git
+# Faster-Whisper has native timestamps.  Keep the optional CTC extension out
+# of the default Windows install because it requires MSVC Build Tools.
+asrlabs @ git+https://github.com/MurthiNext/ASRLabs.git
+nvidia-cudnn-cu12; sys_platform == "win32"
 
 # VoiceTransl
 httpx<0.28
