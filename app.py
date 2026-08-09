@@ -23,9 +23,18 @@ if not _FROZEN:
 
 from PyQt5 import QtGui, QtCore
 from PyQt5.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer, QDateTime, QSize
-from PyQt5.QtWidgets import QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu, QAction, QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget
+from PyQt5.QtWidgets import QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu, QAction, QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget, QScrollArea
 from qfluentwidgets import PushButton as QPushButton, TextEdit as QTextEdit, LineEdit as QLineEdit, ComboBox as QComboBox, Slider as QSlider, FluentWindow as QMainWindow, PlainTextEdit as QPlainTextEdit, SplashScreen, SpinBox as QSpinBox
-from qfluentwidgets import FluentIcon, NavigationItemPosition, SubtitleLabel, TitleLabel, BodyLabel
+from qfluentwidgets import (
+    FluentIcon,
+    NavigationItemPosition,
+    SubtitleLabel,
+    TitleLabel,
+    BodyLabel,
+    Theme,
+    setTheme,
+    setThemeColor,
+)
 
 import re
 import asyncio
@@ -33,6 +42,7 @@ import json
 import yaml
 import threading
 import queue
+import tempfile
 
 from dataclasses import dataclass
 import requests
@@ -55,6 +65,7 @@ def open_path(path_value: str):
 from prompt2srt import make_srt, make_lrc, merge_lrc_files
 from srt2prompt import make_prompt, merge_srt_files
 import asrlabs_bridge
+import crispasr_bridge
 from compat import (
     migrate_config_txt,
     migrate_old_whisper_models,
@@ -77,6 +88,52 @@ ONLINE_TRANSLATOR_MAPPING = {
     'Ollama': 'http://localhost:11434',
     "llamacpp（通用本地模型）": "http://localhost:8989",
 }
+
+DEFAULT_UI_THEME = 'light_blue'
+UI_THEME_OPTIONS = (
+    ('theme_light_blue', 'light_blue'),
+    ('theme_light_teal', 'light_teal'),
+    ('theme_light_purple', 'light_purple'),
+    ('theme_dark_blue', 'dark_blue'),
+    ('theme_dark_teal', 'dark_teal'),
+    ('theme_dark_purple', 'dark_purple'),
+)
+UI_THEME_COLORS = {
+    'blue': '#0078D4',
+    'teal': '#009688',
+    'purple': '#7E57C2',
+}
+DICTIONARY_PRESET_DIR = Path('project') / 'dictionary_presets'
+CRISPASR_DIR = crispasr_bridge.DEFAULT_CRISPASR_DIR
+DEFAULT_CRISPASR_PARAM = (
+    '$crispasr_executable --backend $backend --model $model_file '
+    '--aligner-model $aligner_file --force-aligner --split-on-punct '
+    '--split-on-word --max-len 24 --language $language --output-srt '
+    '--output-file $output_file --file $input_file'
+)
+
+
+def _load_ui_theme() -> str:
+    try:
+        if os.path.exists('gui_settings.yaml'):
+            with open('gui_settings.yaml', 'r', encoding='utf-8') as f:
+                saved_theme = str((yaml.safe_load(f) or {}).get('ui_theme', ''))
+            if saved_theme in {value for _label, value in UI_THEME_OPTIONS}:
+                return saved_theme
+    except Exception:
+        pass
+    return DEFAULT_UI_THEME
+
+
+def _apply_ui_theme(theme_name: str) -> None:
+    selected = (
+        theme_name
+        if theme_name in {value for _label, value in UI_THEME_OPTIONS}
+        else DEFAULT_UI_THEME
+    )
+    brightness, accent = selected.split('_', 1)
+    setTheme(Theme.DARK if brightness == 'dark' else Theme.LIGHT)
+    setThemeColor(UI_THEME_COLORS[accent])
 
 TRANSLATOR_SUPPORTED = [
     '不进行翻译',
@@ -516,7 +573,8 @@ class ConcurrentTranslationPool:
             make_srt(gt_output_json, zh_srt_output)
 
         if output_format in ('目标LRC', '双语LRC'):
-            lrc_output = os.path.join(output_dir, base_name + '.lrc')
+            lrc_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+            lrc_output = os.path.join(output_dir, base_name + lrc_suffix)
             make_lrc(gt_output_json, lrc_output)
 
         if output_format == '双语SRT':
@@ -873,6 +931,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        _apply_ui_theme(_load_ui_theme())
         self.msg_queue = UIMessageQueue(LOG_PATH)
         self.thread = None
         self.worker = None
@@ -886,7 +945,8 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QtGui.QIcon('icon.png'))
         self.init_system_tray()
         self.status.connect(lambda x: self.setWindowTitle(f"{_('window_title')} - {x}"))
-        self.resize(800, 600)
+        self.resize(1180, 760)
+        self.setMinimumSize(960, 640)
         self.splashScreen = SplashScreen(self.windowIcon(), self)
         self.splashScreen.setIconSize(QSize(102, 102))
         self.show()
@@ -914,11 +974,15 @@ class MainWindow(QMainWindow):
 
     def _schedule_auto_save(self):
         """防抖自动保存：短时间内多次调用只执行最后一次"""
+        if self._suppress_auto_save:
+            return
         if self._auto_save_timer and not self._auto_save_timer.isActive():
             self._auto_save_timer.start()
 
     def _auto_save_config(self):
         """执行静默自动保存"""
+        if self._suppress_auto_save:
+            return
         try:
             self.save_config(silent=True)
         except Exception:
@@ -950,9 +1014,15 @@ class MainWindow(QMainWindow):
         change_prompt_mode = self.change_prompt_mode.currentData() if hasattr(self, 'change_prompt_mode') else '不修改'
         auto_shutdown = self.auto_shutdown_checkbox.isChecked() if hasattr(self, 'auto_shutdown_checkbox') else False
         target_translation_lang = self.target_lang.currentData() if hasattr(self, 'target_lang') else 'zh-cn'
+        ui_theme = self.theme_selector.currentData() if hasattr(self, 'theme_selector') else _load_ui_theme()
         current_lang = get_language()
 
         # ASRLabs 配置
+        asr_provider = (
+            self.asr_provider_combo.currentData() or 'asrlabs'
+            if hasattr(self, 'asr_provider_combo')
+            else 'asrlabs'
+        )
         asr_engine = self.asr_engine_combo.currentData() or '' if hasattr(self, 'asr_engine_combo') else ''
         asr_model = self.asr_model_combo.currentData() or '' if hasattr(self, 'asr_model_combo') else ''
         asr_device = self.asr_device_combo.currentText() if hasattr(self, 'asr_device_combo') else 'auto'
@@ -962,6 +1032,9 @@ class MainWindow(QMainWindow):
         align_model = self.align_model_combo.currentData() or '' if hasattr(self, 'align_model_combo') else ''
         align_device = self.align_device_combo.currentText() if hasattr(self, 'align_device_combo') else 'auto'
         align_extra = self.align_extra_edit.toPlainText() if hasattr(self, 'align_extra_edit') else ''
+        crispasr_backend = self.crispasr_backend_combo.currentText() if hasattr(self, 'crispasr_backend_combo') else crispasr_bridge.DEFAULT_CRISPASR_BACKEND
+        crispasr_model = self.crispasr_model_combo.currentText() if hasattr(self, 'crispasr_model_combo') else ''
+        crispasr_aligner = self.crispasr_aligner_combo.currentText() if hasattr(self, 'crispasr_aligner_combo') else ''
 
         gui_settings = {
             'translator': translator,
@@ -985,6 +1058,8 @@ class MainWindow(QMainWindow):
             'log_level_filter': self.log_filter_combo.currentText(),
             'verbose_mode': self.verbose_checkbox.isChecked(),
             'ui_language': current_lang,
+            'ui_theme': ui_theme,
+            'asr_provider': asr_provider,
             # ASRLabs 配置
             'asr_engine': asr_engine,
             'asr_model': asr_model,
@@ -995,6 +1070,10 @@ class MainWindow(QMainWindow):
             'align_model': align_model,
             'align_device': align_device,
             'align_extra': align_extra,
+            # CrispASR 配置
+            'crispasr_backend': crispasr_backend,
+            'crispasr_model': crispasr_model,
+            'crispasr_aligner': crispasr_aligner,
         }
         with open('gui_settings.yaml', 'w', encoding='utf-8') as f:
             yaml.dump(gui_settings, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
@@ -1003,6 +1082,17 @@ class MainWindow(QMainWindow):
 
         with open('llama/param.txt', 'w', encoding='utf-8') as f:
             f.write(self.param_llama.toPlainText())
+
+        if hasattr(self, 'param_crispasr') and asr_provider == 'crispasr':
+            try:
+                CRISPASR_DIR.mkdir(parents=True, exist_ok=True)
+                with open(CRISPASR_DIR / 'param.txt', 'w', encoding='utf-8') as f:
+                    f.write(self.param_crispasr.toPlainText())
+            except OSError as error:
+                self.msg_queue.put(
+                    "detail",
+                    _("status_crispasr_param_save_error", error=error),
+                )
 
         with open('project/dict_pre.txt', 'w', encoding='utf-8') as f:
             f.write(self.before_dict.toPlainText())
@@ -1166,6 +1256,70 @@ class MainWindow(QMainWindow):
             self.uvr_file.addItems(uvr_lst)
             if current_uvr in uvr_lst:
                 self.uvr_file.setCurrentText(current_uvr)
+
+    def refresh_crispasr_lists(self, query_backends: bool = True):
+        """刷新 CrispASR 后端及本地 GGUF 模型列表。"""
+        current_backend = (
+            self.crispasr_backend_combo.currentText()
+            if hasattr(self, 'crispasr_backend_combo')
+            else ''
+        )
+        current_model = (
+            self.crispasr_model_combo.currentText()
+            if hasattr(self, 'crispasr_model_combo')
+            else ''
+        )
+        current_aligner = (
+            self.crispasr_aligner_combo.currentText()
+            if hasattr(self, 'crispasr_aligner_combo')
+            else ''
+        )
+
+        if query_backends:
+            backends = crispasr_bridge.list_backends(
+                CRISPASR_DIR,
+                timeout=3,
+            )
+            self._crispasr_discovery_done = True
+        else:
+            backends = list(crispasr_bridge.CRISPASR_BACKEND_FALLBACK)
+        models = crispasr_bridge.list_models(CRISPASR_DIR)
+        aligners = crispasr_bridge.list_aligners(CRISPASR_DIR)
+
+        self.crispasr_backend_combo.blockSignals(True)
+        self.crispasr_backend_combo.clear()
+        self.crispasr_backend_combo.addItems(backends)
+        selected_backend = current_backend or crispasr_bridge.DEFAULT_CRISPASR_BACKEND
+        backend_index = self.crispasr_backend_combo.findText(selected_backend)
+        if backend_index >= 0:
+            self.crispasr_backend_combo.setCurrentIndex(backend_index)
+        self.crispasr_backend_combo.blockSignals(False)
+
+        self.crispasr_model_combo.clear()
+        self.crispasr_model_combo.addItems(models)
+        if current_model:
+            model_index = self.crispasr_model_combo.findText(current_model)
+            if model_index >= 0:
+                self.crispasr_model_combo.setCurrentIndex(model_index)
+
+        self.crispasr_aligner_combo.clear()
+        self.crispasr_aligner_combo.addItems(aligners)
+        if current_aligner:
+            aligner_index = self.crispasr_aligner_combo.findText(current_aligner)
+            if aligner_index >= 0:
+                self.crispasr_aligner_combo.setCurrentIndex(aligner_index)
+
+    def on_asr_provider_changed(self, _index: int = -1):
+        provider = self.asr_provider_combo.currentData() or 'asrlabs'
+        use_asrlabs = provider == 'asrlabs'
+        for widget in getattr(self, '_asrlabs_widgets', []):
+            widget.setVisible(use_asrlabs)
+        for widget in getattr(self, '_crispasr_widgets', []):
+            widget.setVisible(not use_asrlabs)
+        if not use_asrlabs and not getattr(self, '_crispasr_discovery_done', False):
+            self.refresh_crispasr_lists(query_backends=True)
+        if not self._suppress_auto_save:
+            self._schedule_auto_save()
 
     def refresh_asr_engine_lists(self):
         """刷新 ASRLabs 引擎列表、模型列表和对齐器列表
@@ -1360,6 +1514,19 @@ class MainWindow(QMainWindow):
                 _tl_idx = self.target_lang.findData(gui_settings.get('target_translation_lang', 'zh-cn'))
                 if _tl_idx >= 0:
                     self.target_lang.setCurrentIndex(_tl_idx)
+            if hasattr(self, 'theme_selector'):
+                _theme_idx = self.theme_selector.findData(
+                    gui_settings.get('ui_theme', DEFAULT_UI_THEME)
+                )
+                if _theme_idx >= 0:
+                    self.theme_selector.setCurrentIndex(_theme_idx)
+
+            if hasattr(self, 'asr_provider_combo'):
+                provider_index = self.asr_provider_combo.findData(
+                    gui_settings.get('asr_provider', 'asrlabs')
+                )
+                if provider_index >= 0:
+                    self.asr_provider_combo.setCurrentIndex(provider_index)
 
             # ── ASRLabs 配置加载 + 旧配置迁移 ──
             # 旧配置迁移：检测 whisper_file → 迁移模型文件 → 清理旧目录（须在刷新引擎列表之前）
@@ -1414,6 +1581,28 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'align_extra_edit'):
                 self.align_extra_edit.setPlainText(gui_settings.get('align_extra', ''))
 
+            if hasattr(self, 'crispasr_backend_combo'):
+                backend = gui_settings.get(
+                    'crispasr_backend', crispasr_bridge.DEFAULT_CRISPASR_BACKEND
+                )
+                backend_index = self.crispasr_backend_combo.findText(backend)
+                if backend_index >= 0:
+                    self.crispasr_backend_combo.setCurrentIndex(backend_index)
+            if hasattr(self, 'crispasr_model_combo'):
+                model_index = self.crispasr_model_combo.findText(
+                    gui_settings.get('crispasr_model', '')
+                )
+                if model_index >= 0:
+                    self.crispasr_model_combo.setCurrentIndex(model_index)
+            if hasattr(self, 'crispasr_aligner_combo'):
+                aligner_index = self.crispasr_aligner_combo.findText(
+                    gui_settings.get('crispasr_aligner', '')
+                )
+                if aligner_index >= 0:
+                    self.crispasr_aligner_combo.setCurrentIndex(aligner_index)
+            if hasattr(self, 'asr_provider_combo'):
+                self.on_asr_provider_changed()
+
         # API Key 始终从 .env 加载
         api_key = _load_api_key()
         if api_key:
@@ -1427,6 +1616,11 @@ class MainWindow(QMainWindow):
         if os.path.exists('llama/param.txt'):
             with open('llama/param.txt', 'r', encoding='utf-8') as f:
                 self.param_llama.setPlainText(f.read())
+
+        crispasr_param_path = CRISPASR_DIR / 'param.txt'
+        if hasattr(self, 'param_crispasr') and crispasr_param_path.is_file():
+            with open(crispasr_param_path, 'r', encoding='utf-8') as f:
+                self.param_crispasr.setPlainText(f.read())
 
         if os.path.exists('project/dict_pre.txt'):
             with open('project/dict_pre.txt', 'r', encoding='utf-8') as f:
@@ -1544,10 +1738,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """确保在关闭窗口时停止定时器并关闭子进程，检查本地模型是否已关闭"""
-        try:
-            self.save_config(silent=True)
-        except Exception:
-            pass
+        if not self._suppress_auto_save:
+            try:
+                self.save_config(silent=True)
+            except Exception:
+                pass
         self.timer.stop()
         self.shutdown_children()
 
@@ -1671,6 +1866,22 @@ class MainWindow(QMainWindow):
         self.about_title_label = TitleLabel(_("about_title"))
         self.about_layout.addWidget(self.about_title_label)
 
+        avatar_path = Path('avatar.png')
+        if avatar_path.is_file():
+            avatar = QtGui.QPixmap(str(avatar_path))
+            if not avatar.isNull():
+                self.avatar_label = QLabel()
+                self.avatar_label.setAlignment(Qt.AlignCenter)
+                self.avatar_label.setPixmap(
+                    avatar.scaled(
+                        180,
+                        180,
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
+                self.about_layout.addWidget(self.avatar_label)
+
         # mode
         self.mode_text = QTextEdit()
         self.mode_text.setReadOnly(True)
@@ -1728,6 +1939,13 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.Information,
                 3000
             )
+
+    def _on_theme_changed(self, _index: int):
+        theme_name = self.theme_selector.currentData()
+        if theme_name:
+            _apply_ui_theme(theme_name)
+        if not self._suppress_auto_save:
+            self._schedule_auto_save()
 
     def initInputOutputTab(self):
         self.input_output_tab = Widget("Home", self)
@@ -1910,11 +2128,164 @@ class MainWindow(QMainWindow):
             self.change_prompt_mode.setCurrentIndex(_default_pm_idx)
         self.dict_layout.addWidget(self.change_prompt_mode)
 
+        DICTIONARY_PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        self.dictionary_presets_title = SubtitleLabel(_("dictionary_presets_title"))
+        self.dict_layout.addWidget(self.dictionary_presets_title)
+
+        preset_name_layout = QHBoxLayout()
+        self.dictionary_preset_name_label = BodyLabel(_("dictionary_preset_name_label"))
+        preset_name_layout.addWidget(self.dictionary_preset_name_label)
+        self.dictionary_preset_name_edit = QLineEdit()
+        self.dictionary_preset_name_edit.setPlaceholderText(_("dictionary_preset_name_label"))
+        preset_name_layout.addWidget(self.dictionary_preset_name_edit, 1)
+        self.save_dictionary_preset_button = QPushButton(_("dictionary_preset_save"))
+        self.save_dictionary_preset_button.clicked.connect(self.save_dictionary_preset)
+        preset_name_layout.addWidget(self.save_dictionary_preset_button)
+        self.dict_layout.addLayout(preset_name_layout)
+
+        preset_action_layout = QHBoxLayout()
+        self.dictionary_preset_combo = QComboBox()
+        preset_action_layout.addWidget(self.dictionary_preset_combo, 1)
+        self.load_dictionary_preset_button = QPushButton(_("dictionary_preset_load"))
+        self.load_dictionary_preset_button.clicked.connect(self.load_dictionary_preset)
+        preset_action_layout.addWidget(self.load_dictionary_preset_button)
+        self.refresh_dictionary_presets_button = QPushButton(_("dictionary_preset_refresh"))
+        self.refresh_dictionary_presets_button.clicked.connect(self.refresh_dictionary_presets)
+        preset_action_layout.addWidget(self.refresh_dictionary_presets_button)
+        self.open_dictionary_presets_button = QPushButton(_("dictionary_preset_open_dir"))
+        self.open_dictionary_presets_button.clicked.connect(
+            lambda: open_path(str(DICTIONARY_PRESET_DIR))
+        )
+        preset_action_layout.addWidget(self.open_dictionary_presets_button)
+        self.dict_layout.addLayout(preset_action_layout)
+
+        self.dictionary_preset_combo.currentTextChanged.connect(
+            self._on_dictionary_preset_selected
+        )
+        self.refresh_dictionary_presets()
+
         self.addSubInterface(self.dict_tab, FluentIcon.SETTING, _("tab_dict"), NavigationItemPosition.TOP)
+
+    @staticmethod
+    def _dictionary_preset_path(name: str) -> tuple[Path, str]:
+        invalid_filename_chars = set('<>:"/\\|?*')
+        safe_name = ''.join(
+            '_' if char in invalid_filename_chars or ord(char) < 32 else char
+            for char in (name or '')
+        )
+        safe_name = re.sub(r'\s+', ' ', safe_name).strip(' .')[:80]
+        if not safe_name:
+            raise ValueError(_("dictionary_preset_name_required"))
+        preset_dir = DICTIONARY_PRESET_DIR.resolve()
+        preset_dir.mkdir(parents=True, exist_ok=True)
+        return preset_dir / f"{safe_name}.yaml", safe_name
+
+    def _on_dictionary_preset_selected(self, name: str):
+        if name:
+            self.dictionary_preset_name_edit.setText(name)
+
+    def refresh_dictionary_presets(self, selected_name: str | None = None):
+        DICTIONARY_PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        names = sorted(
+            path.stem
+            for path in DICTIONARY_PRESET_DIR.glob('*.yaml')
+            if path.is_file()
+        )
+        self.dictionary_preset_combo.blockSignals(True)
+        self.dictionary_preset_combo.clear()
+        self.dictionary_preset_combo.addItems(names)
+        if selected_name:
+            selected_index = self.dictionary_preset_combo.findText(selected_name)
+            if selected_index >= 0:
+                self.dictionary_preset_combo.setCurrentIndex(selected_index)
+            self.dictionary_preset_name_edit.setText(selected_name)
+        self.dictionary_preset_combo.blockSignals(False)
+
+    def save_dictionary_preset(self):
+        try:
+            path, safe_name = self._dictionary_preset_path(
+                self.dictionary_preset_name_edit.text()
+            )
+            payload = {
+                'version': 1,
+                'name': safe_name,
+                'before_dict': self.before_dict.toPlainText(),
+                'gpt_dict': self.gpt_dict.toPlainText(),
+                'after_dict': self.after_dict.toPlainText(),
+                'extra_prompt': self.extra_prompt.toPlainText(),
+                'change_prompt_mode': self.change_prompt_mode.currentData(),
+            }
+            temp_path = path.with_suffix('.yaml.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+            os.replace(temp_path, path)
+            self.refresh_dictionary_presets(safe_name)
+            self._emit_status(_("dictionary_preset_saved", name=safe_name))
+        except Exception as error:
+            self._emit_status(_("dictionary_preset_save_error", error=error))
+
+    def load_dictionary_preset(self):
+        try:
+            selected_name = (
+                self.dictionary_preset_combo.currentText().strip()
+                or self.dictionary_preset_name_edit.text().strip()
+            )
+            path, safe_name = self._dictionary_preset_path(selected_name)
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = yaml.safe_load(f) or {}
+            self.before_dict.setPlainText(str(payload.get('before_dict', '')))
+            self.gpt_dict.setPlainText(str(payload.get('gpt_dict', '')))
+            self.after_dict.setPlainText(str(payload.get('after_dict', '')))
+            self.extra_prompt.setPlainText(str(payload.get('extra_prompt', '')))
+            prompt_mode = payload.get('change_prompt_mode', '不修改')
+            prompt_index = self.change_prompt_mode.findData(prompt_mode)
+            if prompt_index >= 0:
+                self.change_prompt_mode.setCurrentIndex(prompt_index)
+            self.dictionary_preset_name_edit.setText(safe_name)
+            self._schedule_auto_save()
+            self._emit_status(_("dictionary_preset_loaded", name=safe_name))
+        except Exception as error:
+            self._emit_status(_("dictionary_preset_load_error", error=error))
         
     def initSettingsTab(self):
         self.settings_tab = Widget("Settings", self)
-        self.settings_layout = self.settings_tab.vBoxLayout
+        self.settings_scroll_area = QScrollArea(self.settings_tab)
+        self.settings_scroll_area.setWidgetResizable(True)
+        self.settings_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.settings_content = QWidget()
+        self.settings_content.setObjectName('SettingsContent')
+        self.settings_layout = QVBoxLayout(self.settings_content)
+        self.settings_layout.setContentsMargins(8, 8, 8, 8)
+        self.settings_scroll_area.setWidget(self.settings_content)
+        self.settings_tab.vBoxLayout.addWidget(self.settings_scroll_area)
+
+        theme_layout = QHBoxLayout()
+        self.config_theme_label = BodyLabel(_("config_theme_label"))
+        theme_layout.addWidget(self.config_theme_label)
+        self.theme_selector = QComboBox()
+        for label_key, theme_name in UI_THEME_OPTIONS:
+            self.theme_selector.addItem(_(label_key), userData=theme_name)
+        current_theme_index = self.theme_selector.findData(_load_ui_theme())
+        if current_theme_index >= 0:
+            self.theme_selector.setCurrentIndex(current_theme_index)
+        self.theme_selector.currentIndexChanged.connect(self._on_theme_changed)
+        theme_layout.addWidget(self.theme_selector, 1)
+        self.settings_layout.addLayout(theme_layout)
+
+        provider_layout = QHBoxLayout()
+        self.settings_asr_provider_label = BodyLabel(_("settings_asr_provider_label"))
+        provider_layout.addWidget(self.settings_asr_provider_label)
+        self.asr_provider_combo = QComboBox()
+        self.asr_provider_combo.addItem(
+            _("settings_asr_provider_asrlabs"), userData='asrlabs'
+        )
+        self.asr_provider_combo.addItem(
+            _("settings_asr_provider_crispasr"), userData='crispasr'
+        )
+        provider_layout.addWidget(self.asr_provider_combo, 1)
+        self.settings_layout.addLayout(provider_layout)
 
         # ── ASRLabs 听写引擎 ──
         self.settings_asr_engine_label = BodyLabel(_("settings_asr_engine_label"))
@@ -1997,6 +2368,82 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.refresh_asr_btn)
         self.settings_layout.addLayout(button_layout)
 
+        self._asrlabs_widgets = [
+            self.settings_asr_engine_label,
+            self.asr_engine_combo,
+            self.settings_asr_model_label,
+            self.asr_model_combo,
+            self.settings_asr_device_label,
+            self.asr_device_combo,
+            self.settings_asr_compute_type_label,
+            self.asr_compute_type_combo,
+            self.settings_asr_extra_label,
+            self.asr_extra_edit,
+            self.settings_align_engine_label,
+            self.align_engine_combo,
+            self.settings_align_model_label,
+            self.align_model_combo,
+            self.settings_align_device_label,
+            self.align_device_combo,
+            self.settings_align_extra_label,
+            self.align_extra_edit,
+            self.open_transcribe_dir_btn,
+            self.open_align_dir_btn,
+            self.refresh_asr_btn,
+        ]
+
+        # ── CrispASR GGUF ──
+        self.settings_crispasr_backend_label = BodyLabel(_("settings_crispasr_backend_label"))
+        self.settings_layout.addWidget(self.settings_crispasr_backend_label)
+        self.crispasr_backend_combo = QComboBox()
+        self.settings_layout.addWidget(self.crispasr_backend_combo)
+
+        self.settings_crispasr_model_label = BodyLabel(_("settings_crispasr_model_label"))
+        self.settings_layout.addWidget(self.settings_crispasr_model_label)
+        self.crispasr_model_combo = QComboBox()
+        self.settings_layout.addWidget(self.crispasr_model_combo)
+
+        self.settings_crispasr_aligner_label = BodyLabel(_("settings_crispasr_aligner_label"))
+        self.settings_layout.addWidget(self.settings_crispasr_aligner_label)
+        self.crispasr_aligner_combo = QComboBox()
+        self.settings_layout.addWidget(self.crispasr_aligner_combo)
+
+        self.settings_crispasr_param_label = BodyLabel(_("settings_crispasr_param_label"))
+        self.settings_layout.addWidget(self.settings_crispasr_param_label)
+        self.param_crispasr = QTextEdit()
+        self.param_crispasr.setPlaceholderText(_("settings_crispasr_param_placeholder"))
+        self.param_crispasr.setMaximumHeight(100)
+        self.param_crispasr.setPlainText(DEFAULT_CRISPASR_PARAM)
+        self.settings_layout.addWidget(self.param_crispasr)
+
+        crispasr_button_layout = QHBoxLayout()
+        self.open_crispasr_dir_btn = QPushButton(_("settings_open_crispasr_btn"))
+        self.open_crispasr_dir_btn.clicked.connect(
+            lambda: open_path(str(CRISPASR_DIR))
+        )
+        crispasr_button_layout.addWidget(self.open_crispasr_dir_btn)
+        self.refresh_crispasr_btn = QPushButton(_("settings_refresh_crispasr_btn"))
+        self.refresh_crispasr_btn.clicked.connect(
+            lambda: self.refresh_crispasr_lists(query_backends=True)
+        )
+        crispasr_button_layout.addWidget(self.refresh_crispasr_btn)
+        self.settings_layout.addLayout(crispasr_button_layout)
+
+        self._crispasr_widgets = [
+            self.settings_crispasr_backend_label,
+            self.crispasr_backend_combo,
+            self.settings_crispasr_model_label,
+            self.crispasr_model_combo,
+            self.settings_crispasr_aligner_label,
+            self.crispasr_aligner_combo,
+            self.settings_crispasr_param_label,
+            self.param_crispasr,
+            self.open_crispasr_dir_btn,
+            self.refresh_crispasr_btn,
+        ]
+        self._crispasr_discovery_done = False
+        self.refresh_crispasr_lists(query_backends=False)
+
         # UVR models
         self.settings_uvr_label = BodyLabel(_("settings_uvr_label"))
         self.settings_layout.addWidget(self.settings_uvr_label)
@@ -2013,6 +2460,8 @@ class MainWindow(QMainWindow):
 
         # 引擎选择变更时动态更新对齐引擎下拉框
         self.asr_engine_combo.currentIndexChanged.connect(self.on_asr_engine_changed)
+        self.asr_provider_combo.currentIndexChanged.connect(self.on_asr_provider_changed)
+        self.on_asr_provider_changed()
 
         # Sync transcription language between IO tab and Settings tab
         def sync_transcription_to_settings(idx):
@@ -2139,6 +2588,9 @@ class MainWindow(QMainWindow):
         self.run_clip_button = QPushButton(_("clip_run_btn"))
         self.run_clip_button.clicked.connect(self.run_clip)
         self.clip_layout.addWidget(self.run_clip_button)
+        self.clip_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.clip_cancel_button.clicked.connect(self.cancel_task)
+        self.clip_layout.addWidget(self.clip_cancel_button)
 
         # Vocal Split
         self.clip_vocal_split_label = BodyLabel(_("clip_vocal_split_label"))
@@ -2152,6 +2604,9 @@ class MainWindow(QMainWindow):
         self.run_uvr_button = QPushButton(_("clip_vocal_run_btn"))
         self.run_uvr_button.clicked.connect(self.run_vocal_split)
         self.clip_layout.addWidget(self.run_uvr_button)
+        self.uvr_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.uvr_cancel_button.clicked.connect(self.cancel_task)
+        self.clip_layout.addWidget(self.uvr_cancel_button)
 
         self.addSubInterface(self.clip_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_clip"), NavigationItemPosition.TOP)
 
@@ -2213,6 +2668,9 @@ class MainWindow(QMainWindow):
         self.run_synth_button = QPushButton(_("synth_run_btn"))
         self.run_synth_button.clicked.connect(self.run_synth)
         hbox.addWidget(self.run_synth_button)
+        self.synth_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.synth_cancel_button.clicked.connect(self.cancel_task)
+        hbox.addWidget(self.synth_cancel_button)
         self.synth_layout.addLayout(hbox)
 
         # Audio Synth
@@ -2226,6 +2684,9 @@ class MainWindow(QMainWindow):
         self.run_synth_audio_button = QPushButton(_("synth_audio_run_btn"))
         self.run_synth_audio_button.clicked.connect(self.run_synth_audio)
         self.synth_layout.addWidget(self.run_synth_audio_button)
+        self.synth_audio_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.synth_audio_cancel_button.clicked.connect(self.cancel_task)
+        self.synth_layout.addWidget(self.synth_audio_cancel_button)
 
         self.addSubInterface(self.synth_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_synth"), NavigationItemPosition.TOP)
 
@@ -2250,6 +2711,9 @@ class MainWindow(QMainWindow):
         self.run_summarize_button = QPushButton(_("summarize_run_btn"))
         self.run_summarize_button.clicked.connect(self.run_summarize)
         self.summarize_layout.addWidget(self.run_summarize_button)
+        self.summarize_cancel_button = QPushButton(_("io_cancel_btn"))
+        self.summarize_cancel_button.clicked.connect(self.cancel_task)
+        self.summarize_layout.addWidget(self.summarize_cancel_button)
 
         self.addSubInterface(self.summarize_tab, FluentIcon.DEVELOPER_TOOLS, _("tab_summarize"), NavigationItemPosition.TOP)
 
@@ -2358,10 +2822,17 @@ class MainWindow(QMainWindow):
             shutil.rmtree('project/cache')
         os.makedirs('project/cache', exist_ok=True)
 
+class TaskCancelledError(Exception):
+    """用户主动取消后台任务。"""
+
+
 def error_handler(func):
     def wrapper(self):
         try:
             func(self)
+        except TaskCancelledError:
+            self.finished.emit()
+            self.stop()
         except Exception as e:
             self._emit_status(_("status_generic_error", error=e))
             self.finished.emit()
@@ -2383,6 +2854,8 @@ class MainWorker(QObject):
         self._proc_readers = {}
         self._stop_requested = False
         self._stop_event = asyncio.Event()
+        # MainWorker 在界面线程中创建；此处先冻结 ASR 控件，随后再移动到 QThread。
+        self._task_asr_config = self._capture_asr_config()
 
     def _emit_status(self, msg: str):
         """同时向统一消息队列和窗口标题发送状态消息"""
@@ -2441,6 +2914,21 @@ class MainWorker(QObject):
         self._terminate_all_children()
         if hasattr(self, '_translation_pool') and self._translation_pool:
             self._translation_pool.stop()
+
+    def _raise_if_cancelled(self):
+        if self._stop_requested or self._stop_event.is_set():
+            raise TaskCancelledError()
+
+    def _copy_file_with_cancel(self, source, destination, chunk_size=8 * 1024 * 1024):
+        """分块复制识别输入，并在大文件复制期间响应取消。"""
+        with open(source, 'rb') as source_file, open(destination, 'wb') as target_file:
+            while True:
+                self._raise_if_cancelled()
+                chunk = source_file.read(chunk_size)
+                if not chunk:
+                    break
+                target_file.write(chunk)
+        self._raise_if_cancelled()
 
     def _check_auto_shutdown(self):
         """检查是否需要自动关机"""
@@ -2875,27 +3363,73 @@ class MainWorker(QObject):
             
         self.finished.emit()
 
-    def _process_single_audio(self, wav_file, language, json_path, start_named_proc, stop_named_proc):
+    def _capture_asr_config(self):
+        """在任务启动时冻结 ASR 设置，避免运行中切换导致同一任务混用后端。"""
+        return {
+            'provider': self.master.asr_provider_combo.currentData() or 'asrlabs',
+            'asr_engine': self.master.asr_engine_combo.currentData() or '',
+            'asr_model': self.master.asr_model_combo.currentData() or '',
+            'asr_device': self.master.asr_device_combo.currentText(),
+            'asr_compute_type': self.master.asr_compute_type_combo.currentText(),
+            'asr_extra': self.master.asr_extra_edit.toPlainText(),
+            'align_engine': self.master.align_engine_combo.currentData() or 'none',
+            'align_model': self.master.align_model_combo.currentData() or '',
+            'align_device': self.master.align_device_combo.currentText(),
+            'align_extra': self.master.align_extra_edit.toPlainText(),
+            'crispasr_backend': self.master.crispasr_backend_combo.currentText(),
+            'crispasr_model': self.master.crispasr_model_combo.currentText(),
+            'crispasr_aligner': self.master.crispasr_aligner_combo.currentText(),
+            'crispasr_param': self.master.param_crispasr.toPlainText().strip(),
+        }
+
+    def _process_single_audio(
+        self,
+        wav_file,
+        language,
+        json_path,
+        start_named_proc,
+        stop_named_proc,
+        asr_config=None,
+    ):
         """处理单个音频文件的听写
 
-        改造后通过 ASRLabs bridge 调用 asrlabs transcribe + align，
-        再将结果转为 GalTransl JSON 格式。
+        根据界面选择分发到 ASRLabs 或 CrispASR，再统一生成
+        GalTransl JSON，后续翻译和字幕输出不区分识别提供方。
         """
+        asr_config = asr_config or self._task_asr_config
+        asr_provider = asr_config['provider']
+        if asr_provider == 'crispasr':
+            try:
+                self._process_crispasr_audio(
+                    wav_file,
+                    language,
+                    json_path,
+                    start_named_proc,
+                    stop_named_proc,
+                    asr_config,
+                )
+            except TaskCancelledError:
+                raise
+            except Exception as error:
+                self._emit_status(_("status_crispasr_error", error=error))
+                raise
+            return
+
         base_path = wav_file[:-4]  # 去掉 .wav
 
         # 从 master 获取 ASRLabs 配置
-        asr_engine = self.master.asr_engine_combo.currentData() or ''
+        asr_engine = asr_config['asr_engine']
         if not asr_engine:
             return
 
-        asr_model = self.master.asr_model_combo.currentData() or ''
-        asr_device = self.master.asr_device_combo.currentText()
-        asr_compute_type = self.master.asr_compute_type_combo.currentText()
-        asr_extra = self.master.asr_extra_edit.toPlainText()
-        align_engine = self.master.align_engine_combo.currentData() or 'none'
-        align_model = self.master.align_model_combo.currentData() or ''
-        align_device = self.master.align_device_combo.currentText()
-        align_extra = self.master.align_extra_edit.toPlainText()
+        asr_model = asr_config['asr_model']
+        asr_device = asr_config['asr_device']
+        asr_compute_type = asr_config['asr_compute_type']
+        asr_extra = asr_config['asr_extra']
+        align_engine = asr_config['align_engine']
+        align_model = asr_config['align_model']
+        align_device = asr_config['align_device']
+        align_extra = asr_config['align_extra']
 
         output_dir = os.path.abspath(os.path.dirname(json_path))
         output_name = os.path.basename(json_path).replace('.json', '')
@@ -2930,8 +3464,80 @@ class MainWorker(QObject):
             self._emit_status(_("status_asrlabs_done", output=os.path.basename(json_path)))
 
         except Exception as e:
+            if self._stop_requested or self._stop_event.is_set():
+                raise TaskCancelledError() from e
             self._emit_status(_("status_asrlabs_error", error=e))
             raise
+
+    def _process_crispasr_audio(
+        self,
+        wav_file,
+        language,
+        json_path,
+        start_named_proc,
+        stop_named_proc,
+        asr_config=None,
+    ):
+        """运行本地 CrispASR GGUF 模型并把 SRT 转成 GalTransl JSON。"""
+        asr_config = asr_config or self._task_asr_config
+        backend = asr_config['crispasr_backend']
+        model_file = asr_config['crispasr_model']
+        aligner_file = asr_config['crispasr_aligner']
+        command_template = asr_config['crispasr_param']
+
+        self._raise_if_cancelled()
+
+        work_root = Path('project/cache/crispasr_jobs').resolve()
+        work_root.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix='job_', dir=work_root))
+        staged_input = work_dir / f"input{Path(wav_file).suffix.lower()}"
+        output_base = work_dir / 'transcript'
+        generated_srt = output_base.with_suffix('.srt')
+
+        self._emit_status(
+            _(
+                "status_crispasr_transcribing",
+                backend=backend,
+                audio=os.path.basename(wav_file),
+            )
+        )
+        try:
+            self._copy_file_with_cancel(wav_file, staged_input)
+            command = crispasr_bridge.build_command(
+                input_file=staged_input,
+                output_file=output_base,
+                model_file=model_file,
+                language=language,
+                command_template=command_template,
+                aligner_file=aligner_file,
+                backend=backend,
+                crispasr_dir=CRISPASR_DIR,
+            )
+            self._raise_if_cancelled()
+            self.msg_queue.put(
+                "detail",
+                f"[CrispASR] {subprocess.list2cmdline(command)}",
+            )
+            asr_proc, _duplicate = start_named_proc('crispasr', command)
+            if self._stop_requested or self._stop_event.is_set():
+                stop_named_proc('crispasr')
+                raise TaskCancelledError()
+            return_code = asr_proc.wait()
+            stop_named_proc('crispasr')
+            self._raise_if_cancelled()
+            if return_code != 0:
+                raise RuntimeError(f"CrispASR exited with code {return_code}")
+            if not generated_srt.is_file() or generated_srt.stat().st_size == 0:
+                raise RuntimeError("CrispASR did not produce a non-empty SRT file")
+
+            Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+            make_prompt(str(generated_srt), json_path)
+            self._emit_status(
+                _("status_crispasr_done", output=os.path.basename(json_path))
+            )
+        finally:
+            stop_named_proc('crispasr')
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     def _process_streaming_audio(
         self,
@@ -2941,14 +3547,16 @@ class MainWorker(QObject):
         base_path,
         output_dir,
         output_format,
+        asr_config=None,
     ):
         """Faster-Whisper 逐段产出并与在线翻译重叠执行。"""
         from streaming_pipeline import run_streaming_pipeline
 
-        asr_model = self.master.asr_model_combo.currentData() or ''
-        asr_device = self.master.asr_device_combo.currentText()
-        asr_compute_type = self.master.asr_compute_type_combo.currentText()
-        asr_extra = self.master.asr_extra_edit.toPlainText()
+        asr_config = asr_config or self._task_asr_config
+        asr_model = asr_config['asr_model']
+        asr_device = asr_config['asr_device']
+        asr_compute_type = asr_config['asr_compute_type']
+        asr_extra = asr_config['asr_extra']
 
         with open('project/config.yaml', 'r', encoding='utf-8') as f:
             project_config = yaml.safe_load(f) or {}
@@ -2962,21 +3570,27 @@ class MainWorker(QObject):
         cache_path = os.path.join(workspace, 'translation_cache.json')
 
         self._emit_status(_("status_streaming_start"))
-        result = run_streaming_pipeline(
-            audio_path=wav_file,
-            model_path=asr_model,
-            language=language,
-            device=asr_device,
-            compute_type=asr_compute_type,
-            asr_extra=asr_extra,
-            config_dir='project',
-            source_json=json_path,
-            translated_json=translated_json,
-            cache_path=cache_path,
-            batch_size=batch_size,
-            stop_event=self._stop_event,
-            status=self._emit_status,
-        )
+        try:
+            result = run_streaming_pipeline(
+                audio_path=wav_file,
+                model_path=asr_model,
+                language=language,
+                device=asr_device,
+                compute_type=asr_compute_type,
+                asr_extra=asr_extra,
+                config_dir='project',
+                source_json=json_path,
+                translated_json=translated_json,
+                cache_path=cache_path,
+                batch_size=batch_size,
+                stop_event=self._stop_event,
+                status=self._emit_status,
+            )
+        except Exception as error:
+            if self._stop_requested or self._stop_event.is_set():
+                raise TaskCancelledError() from error
+            raise
+        self._raise_if_cancelled()
 
         base_name = os.path.basename(base_path)
         if output_format in ('原文SRT', '双语SRT'):
@@ -3045,26 +3659,39 @@ class MainWorker(QObject):
         self._emit_status(_("status_audio_duration", duration=total_duration, segments=num_segments))
 
         for i in range(num_segments):
+            self._raise_if_cancelled()
             start_time = i * segment_duration
             end_time = min((i + 1) * segment_duration, total_duration)
             duration = end_time - start_time
 
             segment_file = os.path.join(output_dir, f"segment_{i:04d}.16k.wav")
 
+            proc = None
             try:
-                creationflags = 0x08000000 if os.name == 'nt' else 0
-                proc = subprocess.run(
-                    ['ffmpeg/ffmpeg', '-y', '-i', audio_file, '-ss', str(start_time),
+                proc = self._start_process(
+                    ['ffmpeg/ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                     '-i', audio_file, '-ss', str(start_time),
                      '-t', str(duration), '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', segment_file],
-                    capture_output=True, timeout=120, creationflags=creationflags
+                    label=f'ffmpeg_segment_{i + 1}',
                 )
-                if proc.returncode == 0 and os.path.exists(segment_file):
+                try:
+                    return_code = proc.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    self._emit_status(_("status_segment_slice_fail", idx=i+1))
+                    continue
+                self._raise_if_cancelled()
+                if return_code == 0 and os.path.exists(segment_file):
                     segment_files.append(segment_file)
                 else:
                     self._emit_status(_("status_segment_slice_fail", idx=i+1))
+            except TaskCancelledError:
+                raise
             except Exception as e:
                 self._emit_status(_("status_segment_slice_fail_detail", idx=i+1, error=e))
+            finally:
+                self._cleanup_process(proc)
 
+        self._raise_if_cancelled()
         return segment_files, total_duration
 
     def _merge_segment_translations(self, segment_files, segment_tfs, original_base_path, output_json_path, final_output_dir, output_format, duration):
@@ -3098,12 +3725,14 @@ class MainWorker(QObject):
                     segment_srts_zh.append(zh_srt)
 
             if output_format in ('原文LRC', '双语LRC'):
-                orig_lrc = os.path.join(segment_dir, segment_name + '.lrc')
+                original_suffix = '.orig.lrc' if output_format == '双语LRC' else '.lrc'
+                orig_lrc = os.path.join(segment_dir, segment_name + original_suffix)
                 if os.path.exists(orig_lrc):
                     segment_lrcs_orig.append(orig_lrc)
 
             if output_format in ('目标LRC', '双语LRC'):
-                zh_lrc = os.path.join(segment_dir, segment_name + '.zh.lrc')
+                target_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+                zh_lrc = os.path.join(segment_dir, segment_name + target_suffix)
                 if os.path.exists(zh_lrc):
                     segment_lrcs_zh.append(zh_lrc)
 
@@ -3130,7 +3759,8 @@ class MainWorker(QObject):
             merge_lrc_files(segment_lrcs_orig, final_lrc, duration)
 
         if output_format in ('目标LRC', '双语LRC'):
-            final_zh_lrc = os.path.join(final_output_dir, base_name + '.zh.lrc')
+            target_suffix = '.zh.lrc' if output_format == '双语LRC' else '.lrc'
+            final_zh_lrc = os.path.join(final_output_dir, base_name + target_suffix)
             merge_lrc_files(segment_lrcs_zh, final_zh_lrc, duration)
 
         if output_format == '双语LRC':
@@ -3150,7 +3780,15 @@ class MainWorker(QObject):
         
         self.save_config()
         input_files = self.master.input_files_list.toPlainText()
-        asr_engine = self.master.asr_engine_combo.currentData() or ''
+        asr_config = dict(self._task_asr_config)
+        asr_provider = asr_config['provider']
+        asr_engine = asr_config['asr_engine']
+        crispasr_model = asr_config['crispasr_model']
+        transcription_enabled = (
+            bool(asr_engine)
+            if asr_provider == 'asrlabs'
+            else bool(crispasr_model)
+        )
         translator = self.master.translator_group.currentText()
         language = self.master.input_lang.currentText()
         sakura_file = self.master.sakura_file.currentText()
@@ -3272,7 +3910,7 @@ class MainWorker(QObject):
         # 主线程：顺序执行下载+听写，产出放入队列
         for idx, input_file in enumerate(input_files):
             if self._stop_event.is_set():
-                break
+                raise TaskCancelledError()
             if not os.path.exists(input_file):
                 if input_file.startswith('BV'):
                     self._emit_status(_("status_downloading_video"))
@@ -3361,7 +3999,7 @@ class MainWorker(QObject):
                 )
             else:
                 # 音视频输入：提取音频 → 听写（如果已有srt则跳过）
-                if not asr_engine:
+                if not transcription_enabled:
                     self._emit_status(_("status_no_transcribe_skip"))
                     continue
 
@@ -3410,6 +4048,7 @@ class MainWorker(QObject):
                 )
                 ffmpeg_proc.wait()
                 stop_named_proc('ffmpeg_extract')
+                self._raise_if_cancelled()
 
                 if not os.path.exists(wav_file):
                     self._emit_status(_("status_audio_extract_error"))
@@ -3420,12 +4059,14 @@ class MainWorker(QObject):
                 json_path = os.path.join(transcribed_dir, os.path.basename(base_path) + '.json')
 
                 total_duration = self._get_audio_duration(wav_file)
+                self._raise_if_cancelled()
                 threshold_seconds = segment_duration_minutes * 60
 
-                align_engine = self.master.align_engine_combo.currentData() or 'none'
+                align_engine = asr_config['align_engine']
                 if (
                     enable_streaming
                     and need_translate
+                    and asr_provider == 'asrlabs'
                     and asr_engine == 'faster-whisper'
                     and align_engine == 'none'
                 ):
@@ -3436,6 +4077,7 @@ class MainWorker(QObject):
                         base_path,
                         current_output_dir,
                         output_format,
+                        asr_config,
                     )
                     if os.path.exists(wav_file):
                         os.remove(wav_file)
@@ -3453,6 +4095,7 @@ class MainWorker(QObject):
 
                     # 切分音频
                     segment_files, _unused = self._split_audio(wav_file, segment_duration_minutes, segment_dir)
+                    self._raise_if_cancelled()
 
                     if not segment_files:
                         self._emit_status(_("status_segment_fail"))
@@ -3464,7 +4107,7 @@ class MainWorker(QObject):
                     segment_tfs = []  # 存储每个分段的 TranscribedFile
                     for i, segment_file in enumerate(segment_files):
                         if self._stop_event.is_set():
-                            break
+                            raise TaskCancelledError()
                         self._emit_status(_("status_segment_processing", idx=i+1, total=len(segment_files)))
 
                         segment_base = segment_file[:-4] # 去掉 .wav
@@ -3475,7 +4118,16 @@ class MainWorker(QObject):
                         self._process_single_audio(
                             segment_file, language,
                             segment_json, start_named_proc, stop_named_proc,
+                            asr_config,
                         )
+
+                        if output_format in ('原文SRT', '双语SRT'):
+                            make_srt(segment_json, segment_base + '.srt')
+                        if output_format in ('原文LRC', '双语LRC'):
+                            original_suffix = (
+                                '.orig.lrc' if output_format == '双语LRC' else '.lrc'
+                            )
+                            make_lrc(segment_json, segment_base + original_suffix)
 
                         # 立即提交该分段进行翻译
                         if need_translate:
@@ -3495,6 +4147,7 @@ class MainWorker(QObject):
                         self._emit_status(_("status_wait_segments"))
                         self._translation_pool.done()
                         self._translation_pool.wait_all()
+                        self._raise_if_cancelled()
 
                     # 合并所有片段的翻译结果
                     self._emit_status(_("status_merge_segments"))
@@ -3507,7 +4160,14 @@ class MainWorker(QObject):
                 else:
                     # 正常流程（未启用分段）
                     self._emit_status(_("status_asr_in_progress"))
-                    self._process_single_audio(wav_file, language, json_path, start_named_proc, stop_named_proc)
+                    self._process_single_audio(
+                        wav_file,
+                        language,
+                        json_path,
+                        start_named_proc,
+                        stop_named_proc,
+                        asr_config,
+                    )
 
                     # 生成原文 SRT/LRC 输出
                     if output_format == '原文SRT' or output_format == '双语SRT':
@@ -3539,9 +4199,11 @@ class MainWorker(QObject):
                 self._translation_pool.submit(tf)
 
         # 发送哨兵，等待翻译线程结束
+        self._raise_if_cancelled()
         self._emit_status(_("status_all_transcribed"))
         self._translation_pool.done()
         self._translation_pool.wait_all()
+        self._raise_if_cancelled()
         self._translation_pool.stop()
 
         err_count = self._translation_pool.error_count
