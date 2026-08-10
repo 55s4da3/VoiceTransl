@@ -1,4 +1,5 @@
 import sys, os
+import json
 import re
 import shutil
 import threading
@@ -535,15 +536,26 @@ class MainWindow(QMainWindow):
         self.shared_task_label = BodyLabel(_("task_none"))
         header.addWidget(self.shared_task_label)
         header.addStretch()
+        self.shared_file_label = BodyLabel(_("progress_files", completed="0", total="0"))
+        self.shared_file_label.setVisible(False)
+        header.addWidget(self.shared_file_label)
+        self._output_character_requests = {}
+        self.shared_character_label = BodyLabel(
+            _("progress_characters", count="0")
+        )
+        self.shared_character_label.setToolTip(_("progress_characters_tooltip"))
+        header.addWidget(self.shared_character_label)
         self.shared_state_label = BodyLabel(_("task_state_idle"))
         header.addWidget(self.shared_state_label)
         layout.addLayout(header)
 
         self.shared_progress_bar = QProgressBar()
-        self.shared_progress_bar.setRange(0, 1)
+        self.shared_progress_bar.setRange(0, 100)
         self.shared_progress_bar.setValue(0)
-        self.shared_progress_bar.setTextVisible(False)
-        self.shared_progress_bar.setMaximumHeight(5)
+        self.shared_progress_bar.setFormat("0%")
+        self.shared_progress_bar.setTextVisible(True)
+        self.shared_progress_bar.setMinimumHeight(18)
+        self.shared_progress_bar.setMaximumHeight(18)
         layout.addWidget(self.shared_progress_bar)
 
         self.shared_progress_view = QPlainTextEdit()
@@ -1273,15 +1285,34 @@ class MainWindow(QMainWindow):
 
     def _set_progress_context(self, task_name: str):
         self._active_task_name = task_name
+        self._output_character_requests = {}
+        self.shared_character_label.setText(_("progress_characters", count="0"))
         self.shared_progress_view.clear()
-        self.shared_progress_bar.setRange(0, 0)
+        self._task_progress_phase = ""
+        self._task_progress_current = 0
+        self._task_progress_stage_id = 0
+        self._task_file_completed = 0
+        self._task_file_total = 0
+        self._task_outcome = "running"
+        self.shared_file_label.setText(_("progress_files", completed="0", total="0"))
+        self.shared_file_label.setVisible(False)
+        self.shared_progress_bar.setRange(0, 100)
+        self.shared_progress_bar.setValue(0)
+        self.shared_progress_bar.setFormat("0%")
         self.shared_task_label.setText(task_name)
         self.shared_state_label.setText(_("task_state_running"))
 
     def _on_task_finished(self):
-        self.shared_progress_bar.setRange(0, 1)
-        self.shared_progress_bar.setValue(1)
-        self.shared_state_label.setText(_("task_state_done"))
+        outcome = getattr(self, '_task_outcome', 'success')
+        if outcome == 'success':
+            self.shared_state_label.setText(_("task_state_done"))
+        elif outcome == 'cancelled':
+            self.shared_state_label.setText(_("task_state_cancelled"))
+        else:
+            self.shared_state_label.setText(_("task_state_failed"))
+
+    def _on_task_outcome(self, outcome: str):
+        self._task_outcome = str(outcome or 'error')
 
     def _start_worker_task(
         self,
@@ -1304,8 +1335,12 @@ class MainWindow(QMainWindow):
         self.cancel_token = CancellationToken()
         self.worker = MainWorker(snapshot, self.msg_queue, self.cancel_token)
         self.worker.moveToThread(self.thread)
-        self.thread.started.connect(getattr(self.worker, operation))
+        # Connect to a real QObject slot. Connecting a decorated Python method
+        # directly can make PySide invoke it in the GUI thread.
+        self.thread.started.connect(self.worker.execute)
         self.worker.status.connect(self._on_worker_status)
+        if hasattr(self.worker, 'outcome'):
+            self.worker.outcome.connect(self._on_task_outcome)
         if show_model_dialog:
             self.worker.show_model_dialog.connect(
                 lambda models, target=model_target:
@@ -2225,6 +2260,10 @@ class MainWindow(QMainWindow):
                     if not _line_passes_filter(text, self._log_level_filter):
                         continue
                 detail_lines.append(text)
+            elif target == 'characters':
+                self._update_received_characters(text)
+            elif target == 'progress':
+                self._update_task_progress(text)
 
         if status_lines:
             self.shared_progress_view.appendPlainText('\n'.join(status_lines))
@@ -2235,6 +2274,76 @@ class MainWindow(QMainWindow):
         for widget in (self.log_display, self.shared_progress_view):
             scrollbar = widget.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+
+    def _update_received_characters(self, payload: str):
+        try:
+            event = json.loads(payload)
+            request_id = str(event["request"])
+            characters = max(0, int(event.get("characters", 0)))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        self._output_character_requests[request_id] = {
+            "characters": characters,
+            "final": bool(event.get("final", False)),
+        }
+        received = sum(
+            item["characters"]
+            for item in self._output_character_requests.values()
+        )
+        self.shared_character_label.setText(
+            _("progress_characters", count=f"{received:,}")
+        )
+
+    def _update_task_progress(self, payload: str):
+        try:
+            event = json.loads(payload)
+            kind = str(event.get("kind", "stage"))
+            if kind == "files":
+                total = max(0, int(event.get("total", 0)))
+                completed = max(0, min(total, int(event.get("completed", 0))))
+                if total == getattr(self, '_task_file_total', 0):
+                    completed = max(
+                        completed, getattr(self, '_task_file_completed', 0)
+                    )
+                self._task_file_total = total
+                self._task_file_completed = completed
+                visible = bool(event.get("visible", total > 0)) and total > 0
+                self.shared_file_label.setText(_(
+                    "progress_files",
+                    completed=f"{completed:,}",
+                    total=f"{total:,}",
+                ))
+                self.shared_file_label.setVisible(visible)
+                return
+            if kind != "stage":
+                return
+            stage_id = int(event["stage_id"])
+            total = max(1, int(event["total"]))
+            current = max(0, min(total, int(event.get("current", 0))))
+            phase = str(event.get("phase", "")).strip()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        active_stage_id = getattr(self, '_task_progress_stage_id', 0)
+        if stage_id < active_stage_id:
+            return
+        if stage_id == active_stage_id:
+            current = min(
+                total,
+                max(current, getattr(self, '_task_progress_current', 0)),
+            )
+        else:
+            # A stage identity, rather than its display name, controls reset.
+            # This lets the second file's "AI segmentation" start at zero.
+            self._task_progress_stage_id = stage_id
+        self._task_progress_phase = phase
+        self._task_progress_current = current
+        self.shared_progress_bar.setRange(0, total)
+        self.shared_progress_bar.setValue(current)
+        prefix = f"{phase}  " if phase else ""
+        self.shared_progress_bar.setFormat(
+            f"{prefix}{current:,}/{total:,}  (%p%)"
+        )
 
     def closeEvent(self, event):
         """Cancel asynchronously; never wait for a worker in the Qt event loop."""

@@ -43,9 +43,10 @@ class UIMessageQueue:
         满时丢弃最旧消息（FIFO），避免 OOM。
         同时写入日志文件（自动剥离 ANSI 码）。
         """
-        # 写入日志文件
+        # Internal high-frequency metrics are displayed by the UI but do not
+        # belong in the user log (and can otherwise grow it by megabytes).
         cleaned = _strip_ansi(text)
-        if cleaned.strip():
+        if target not in {"characters", "progress"} and cleaned.strip():
             with self._file_lock:
                 try:
                     with open(self._log_path, 'a', encoding='utf-8', errors='replace') as f:

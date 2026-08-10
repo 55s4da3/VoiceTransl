@@ -6,7 +6,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 import app
@@ -145,6 +145,99 @@ class QtResponsivenessTests(unittest.TestCase):
             window.close()
             self.qt_app.processEvents()
 
+    def test_received_character_counter_combines_and_corrects_requests(self):
+        window = self._window()
+        try:
+            window._set_progress_context('character test')
+            window._update_received_characters(
+                '{"request":"a","characters":10,"final":false}'
+            )
+            window._update_received_characters(
+                '{"request":"b","characters":5,"final":true}'
+            )
+            self.assertIn('15', window.shared_character_label.text())
+            window._update_received_characters(
+                '{"request":"a","characters":12,"final":true}'
+            )
+            self.assertIn('17', window.shared_character_label.text())
+        finally:
+            window.close()
+            self.qt_app.processEvents()
+
+    def test_progress_bar_shows_measured_phase_progress(self):
+        window = self._window()
+        try:
+            window._set_progress_context('progress test')
+            self.assertEqual(window.shared_progress_bar.maximum(), 100)
+            self.assertEqual(window.shared_progress_bar.value(), 0)
+            window._update_task_progress(
+                '{"kind":"files","completed":1,"total":3}'
+            )
+            self.assertFalse(window.shared_file_label.isHidden())
+            self.assertIn('1/3', window.shared_file_label.text())
+            self.assertEqual(window.shared_progress_bar.value(), 0)
+            window._update_task_progress(
+                '{"kind":"files","completed":0,"total":3}'
+            )
+            self.assertIn('1/3', window.shared_file_label.text())
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":1,"current":25,"total":100,"phase":"AI 断句"}'
+            )
+            self.assertEqual(window.shared_progress_bar.value(), 25)
+            self.assertIn('25/100', window.shared_progress_bar.format())
+            self.assertIn('AI 断句', window.shared_progress_bar.format())
+            # Concurrent callbacks for one phase must not move backwards.
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":1,"current":20,"total":100,"phase":"AI 断句"}'
+            )
+            self.assertEqual(window.shared_progress_bar.value(), 25)
+            # The same display name on the next file has a new identity and
+            # must visibly restart from zero.
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":2,"current":0,"total":100,"phase":"AI 断句"}'
+            )
+            self.assertEqual(window.shared_progress_bar.value(), 0)
+            # Delayed updates from stage 1 cannot overwrite stage 2.
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":1,"current":90,"total":100,"phase":"AI 断句"}'
+            )
+            self.assertEqual(window.shared_progress_bar.value(), 0)
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":3,"current":1,"total":4,"phase":"翻译与校对"}'
+            )
+            self.assertEqual(window.shared_progress_bar.maximum(), 4)
+            self.assertEqual(window.shared_progress_bar.value(), 1)
+            window._on_task_outcome('cancelled')
+            window._on_task_finished()
+            self.assertEqual(window.shared_progress_bar.value(), 1)
+            self.assertEqual(
+                window.shared_state_label.text(), app._("task_state_cancelled")
+            )
+        finally:
+            window.close()
+            self.qt_app.processEvents()
+
+    def test_task_finish_does_not_fabricate_stage_or_file_completion(self):
+        window = self._window()
+        try:
+            window._set_progress_context('truthful finish test')
+            window._update_task_progress(
+                '{"kind":"files","completed":1,"total":2}'
+            )
+            window._update_task_progress(
+                '{"kind":"stage","stage_id":1,"current":2,"total":5,"phase":"翻译与校对"}'
+            )
+            window._on_task_outcome('error')
+            window._on_task_finished()
+            self.assertEqual(window.shared_progress_bar.value(), 2)
+            self.assertIn('1/2', window.shared_file_label.text())
+            self.assertEqual(
+                window.shared_state_label.text(), app._("task_state_failed")
+            )
+        finally:
+            window.close()
+            self.qt_app.processEvents()
+
     def test_config_persistence_does_not_block_ui_thread(self):
         window = self._window()
         started = threading.Event()
@@ -178,8 +271,16 @@ class QtResponsivenessTests(unittest.TestCase):
             def __init__(self, _snapshot, _messages, token):
                 super().__init__()
                 self.token = token
+                self.started = threading.Event()
+                self.run_thread_id = None
+
+            @Slot()
+            def execute(self):
+                self.run()
 
             def run(self):
+                self.run_thread_id = threading.get_ident()
+                self.started.set()
                 while not self.token.is_cancelled():
                     self.token.event.wait(0.02)
                 self.finished.emit()
@@ -200,6 +301,9 @@ class QtResponsivenessTests(unittest.TestCase):
             self.qt_app.processEvents()
             self.assertIsNotNone(window.thread)
             self.assertTrue(window.thread.isRunning())
+            worker = window.worker
+            self.assertTrue(worker.started.wait(1))
+            self.assertNotEqual(worker.run_thread_id, threading.get_ident())
             heartbeat.start()
             watcher.start()
             started = time.monotonic()

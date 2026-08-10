@@ -21,8 +21,10 @@ from openai._types import NOT_GIVEN
 import random
 import re
 import time
+import uuid
 from contextlib import suppress
 from GalTransl.TerminalOutput import should_print_translation_logs
+from output_metrics import encode_output_event
 
 
 _GLOBAL_RPM_LOCK = Lock()
@@ -683,6 +685,7 @@ class BaseTranslate:
             if use_proofread_profile and self.proofread_client_list
             else self.thinking_mode
         )
+        output_request_id = uuid.uuid4().hex
         client, token = random.choices(active_client_list, k=1)[0]
         if messages is None:
             messages = [
@@ -702,6 +705,17 @@ class BaseTranslate:
                 raise JobCancelledError()
 
             request_started = time.monotonic()
+            received_characters = 0
+            last_character_report = -1
+            last_character_report_at = request_started
+
+            def emit_character_total(total: int, *, final=False):
+                print(encode_output_event({
+                    "request": output_request_id,
+                    "characters": max(0, int(total)),
+                    "final": bool(final),
+                }), flush=True)
+
             try:
                 if self.tokenStrategy == "random":
                     if api_try_count % 2 == 0:
@@ -795,11 +809,13 @@ class BaseTranslate:
                             if chunk.choices[0].finish_reason:
                                 stream_finish_reason = chunk.choices[0].finish_reason
                             if hasattr(chunk.choices[0].delta, "reasoning_content"):
-                                lastline = lastline + (
+                                reasoning_piece = (
                                     chunk.choices[0].delta.reasoning_content or ""
                                 )
+                                lastline = lastline + reasoning_piece
                             if hasattr(chunk.choices[0].delta, "content"):
                                 content_piece = chunk.choices[0].delta.content or ""
+                                received_characters += len(content_piece)
                                 result = result + content_piece
                                 lastline = lastline + content_piece
                                 stream_line_buffer += content_piece
@@ -821,6 +837,18 @@ class BaseTranslate:
                                     lastline_sp = lastline.split("\n")
                                     print("\n".join(lastline_sp[:-1]))
                                     lastline = lastline_sp[-1]
+                            now = time.monotonic()
+                            if (
+                                received_characters > 0
+                                and (
+                                    last_character_report < 0
+                                    or received_characters - last_character_report >= 32
+                                    or now - last_character_report_at >= 0.2
+                                )
+                            ):
+                                emit_character_total(received_characters)
+                                last_character_report = received_characters
+                                last_character_report_at = now
                         stream_completed = True
                         if stream_line_callback and stream_line_buffer:
                             try:
@@ -844,10 +872,12 @@ class BaseTranslate:
                     try:
                         result = response.choices[0].message.content
                         self._last_chatbot_finish_reason = response.choices[0].finish_reason
+                        received_characters = len(result or "")
                     except:
                         raise ValueError(
                             "response.choices[0].message.content is None, no_candidates"
                         )
+                emit_character_total(received_characters, final=True)
                 self._record_request_health(
                     time.monotonic() - request_started,
                     is_rate_limited=False,

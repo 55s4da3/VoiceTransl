@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable
 
 import httpx
 
@@ -14,9 +16,8 @@ from GalTransl.ConfigHelper import build_httpx_sync_proxy_kwargs
 from tasking import CancellationToken, TaskCancelledError
 
 
-MAX_EFFECTIVE_CHARS = 42
-MAX_DURATION_SECONDS = 8.0
-MAX_SILENCE_GAP_SECONDS = 1.5
+DEFAULT_MAX_OUTPUT_TOKENS = 65536
+DEFAULT_MAX_OUTPUT_CHARACTERS = 262144
 
 
 class RefinementError(ValueError):
@@ -103,34 +104,82 @@ def _joiner(left: str, right: str) -> str:
     return " " if left[-1].isascii() and right[0].isascii() and left[-1].isalnum() and right[0].isalnum() else ""
 
 
-def _extract_jsonline_texts(content: str) -> list[str]:
-    content = content.strip()
-    if content.startswith("{"):
-        try:
-            obj = json.loads(content)
-            if isinstance(obj, dict) and isinstance(obj.get("segments"), list):
-                texts = [item.get("text") for item in obj["segments"] if isinstance(item, dict)]
-                if texts and all(isinstance(text, str) and text.strip() for text in texts):
-                    return texts
-        except json.JSONDecodeError:
-            pass
+def _range_record(item: object) -> tuple[int, int] | None:
+    if not isinstance(item, dict):
+        return None
+    try:
+        start_id = int(item["start_id"])
+        end_id = int(item["end_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return start_id, end_id
 
-    texts: list[str] = []
-    for raw in content.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("```"):
-            continue
-        if "|{" in line and re.match(r"^[a-z0-9]{3}\|", line):
-            line = line.split("|", 1)[1]
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
-            texts.append(item["text"])
-    if not texts:
-        raise RefinementError("AI 未返回有效的断句 JSON")
-    return texts
+
+def _extract_group_ranges(content: str, row_count: int) -> list[tuple[int, int]]:
+    """Parse and strictly validate contiguous source-row groups."""
+    stripped = content.strip()
+    items: list[object] = []
+    try:
+        document = json.loads(stripped)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, list):
+        items = document
+    elif isinstance(document, dict) and isinstance(document.get("groups"), list):
+        items = document["groups"]
+    else:
+        for raw in stripped.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("```"):
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    ranges = [record for item in items if (record := _range_record(item))]
+    if not ranges:
+        raise RefinementError("AI 未返回有效的断句范围")
+    expected_start = 1
+    for start_id, end_id in ranges:
+        if start_id != expected_start or end_id < start_id or end_id > row_count:
+            raise RefinementError("AI 返回的断句范围存在遗漏、重复或越界")
+        expected_start = end_id + 1
+    if expected_start != row_count + 1:
+        raise RefinementError("AI 返回的断句范围没有覆盖完整原文")
+    return ranges
+
+
+def apply_group_ranges(
+    rows: list[dict], ranges: list[tuple[int, int]]
+) -> list[dict]:
+    """Apply the AI's complete grouping verbatim to the original rows."""
+    output: list[dict] = []
+    for start_id, end_id in ranges:
+        grouped_rows = rows[start_id - 1:end_id]
+        grouped = ""
+        for row in grouped_rows:
+            text = str(row.get("message", row.get("text", "")) or "")
+            grouped += _joiner(grouped, text) + text
+        start = float(grouped_rows[0].get("start", 0.0) or 0.0)
+        end = max(start, float(grouped_rows[-1].get("end", start) or start))
+        output.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "message": grouped,
+        })
+    return output
+
+
+def resegment_request_limits(rows: list[dict]) -> tuple[int, int]:
+    """Bound a range-only response without tying it to a provider maximum."""
+    row_count = max(1, len(rows))
+    max_tokens = min(DEFAULT_MAX_OUTPUT_TOKENS, max(2048, row_count * 20 + 1024))
+    max_characters = min(
+        DEFAULT_MAX_OUTPUT_CHARACTERS,
+        max(8192, row_count * 48 + 4096),
+    )
+    return max_tokens, max_characters
 
 
 @dataclass
@@ -139,8 +188,6 @@ class _Timeline:
     semantic_raw_positions: list[int]
     semantic_starts: list[float]
     semantic_ends: list[float]
-    mandatory_boundaries: set[int]
-    preferred_boundaries: set[int]
 
 
 def _word_fields(word: dict) -> tuple[str, float | None, float | None]:
@@ -158,12 +205,8 @@ def _build_timeline(rows: list[dict]) -> _Timeline:
     semantic_raw_positions: list[int] = []
     semantic_starts: list[float] = []
     semantic_ends: list[float] = []
-    mandatory: set[int] = set()
-    preferred: set[int] = set()
-    semantic_count = 0
     raw_offset = 0
     previous_text = ""
-    previous_end: float | None = None
 
     for row_index, row in enumerate(rows):
         text = str(row.get("message", row.get("text", "")) or "")
@@ -173,9 +216,6 @@ def _build_timeline(rows: list[dict]) -> _Timeline:
             separator = _joiner(previous_text, text)
             raw_parts.append(separator)
             raw_offset += len(separator)
-            preferred.add(semantic_count)
-            if previous_end is not None and start - previous_end > MAX_SILENCE_GAP_SECONDS:
-                mandatory.add(semantic_count)
 
         row_raw_start = raw_offset
         raw_parts.append(text)
@@ -211,27 +251,16 @@ def _build_timeline(rows: list[dict]) -> _Timeline:
                 unit_start = unit_end = start
             unit_start = max(start, min(end, unit_start))
             unit_end = max(start, min(end, unit_end))
-            if (
-                precise
-                and semantic_ends
-                and unit_start - semantic_ends[-1] > MAX_SILENCE_GAP_SECONDS
-            ):
-                mandatory.add(semantic_count)
             semantic_raw_positions.append(position)
             semantic_starts.append(unit_start)
             semantic_ends.append(unit_end)
-            semantic_count += 1
-
         previous_text = text
-        previous_end = end
 
     return _Timeline(
         raw_text="".join(raw_parts),
         semantic_raw_positions=semantic_raw_positions,
         semantic_starts=semantic_starts,
         semantic_ends=semantic_ends,
-        mandatory_boundaries=mandatory,
-        preferred_boundaries=preferred,
     )
 
 
@@ -254,57 +283,16 @@ def _validate_requested_boundaries(rows: list[dict], texts: list[str]) -> list[i
     return boundaries
 
 
-def _is_punctuation_boundary(timeline: _Timeline, semantic_index: int) -> bool:
-    if semantic_index <= 0 or semantic_index >= len(timeline.semantic_raw_positions):
-        return False
-    left = timeline.semantic_raw_positions[semantic_index - 1]
-    right = timeline.semantic_raw_positions[semantic_index]
-    between = timeline.raw_text[left + 1:right]
-    return any(unicodedata.category(char).startswith("P") for char in between)
-
-
-def _guard_boundaries(timeline: _Timeline, requested: Iterable[int]) -> list[int]:
-    total = len(timeline.semantic_raw_positions)
-    requested_set = {int(value) for value in requested if 0 < int(value) < total}
-    boundaries = requested_set | timeline.mandatory_boundaries
-    guarded: list[int] = []
-    start = 0
-    candidates = sorted(boundaries | {total})
-    for desired_end in candidates:
-        while desired_end - start > 0:
-            duration = timeline.semantic_ends[desired_end - 1] - timeline.semantic_starts[start]
-            if desired_end - start <= MAX_EFFECTIVE_CHARS and duration <= MAX_DURATION_SECONDS:
-                break
-            char_limit = min(desired_end - 1, start + MAX_EFFECTIVE_CHARS)
-            time_limit = char_limit
-            while time_limit > start + 1 and (
-                timeline.semantic_ends[time_limit - 1] - timeline.semantic_starts[start]
-                > MAX_DURATION_SECONDS
-            ):
-                time_limit -= 1
-            limit = max(start + 1, min(char_limit, time_limit))
-            options = [
-                point for point in range(start + 1, limit + 1)
-                if point in timeline.preferred_boundaries
-                or _is_punctuation_boundary(timeline, point)
-            ]
-            split = options[-1] if options else limit
-            guarded.append(split)
-            start = split
-        if desired_end < total and desired_end > start:
-            guarded.append(desired_end)
-            start = desired_end
-    return sorted(set(guarded))
-
-
 def apply_refinement(rows: list[dict], texts: list[str]) -> list[dict]:
     if not rows:
         return []
     timeline = _build_timeline(rows)
     if not timeline.semantic_raw_positions:
         return [dict(row) for row in rows]
-    requested = _validate_requested_boundaries(rows, texts)
-    boundaries = _guard_boundaries(timeline, requested)
+    # The AI response is already validated as an exact, contiguous grouping.
+    # Preserve those boundaries verbatim; adding local duration/silence splits
+    # can reintroduce the mid-word ASR boundaries this stage is meant to fix.
+    boundaries = _validate_requested_boundaries(rows, texts)
     semantic_ranges: list[tuple[int, int]] = []
     start = 0
     for end in [*boundaries, len(timeline.semantic_raw_positions)]:
@@ -334,78 +322,29 @@ def apply_refinement(rows: list[dict], texts: list[str]) -> list[dict]:
     return output or [dict(row) for row in rows]
 
 
-def apply_partial_refinement(rows: list[dict], texts: list[str]) -> list[dict]:
-    """Use a verified AI prefix and retain original boundaries after its first error."""
-    if not rows or not texts:
-        raise RefinementError("AI 没有可安全采用的断句前缀")
-    timeline = _build_timeline(rows)
-    expected = _semantic_text(timeline.raw_text)
-    cursor = 0
-    verified: list[str] = []
-    for text in texts:
-        semantic = _semantic_text(text)
-        if not semantic or not expected.startswith(semantic, cursor):
-            break
-        verified.append(text)
-        cursor += len(semantic)
-        if cursor >= len(expected):
-            break
-    if not verified or cursor <= 0:
-        raise RefinementError("AI 没有可安全采用的断句前缀")
-    if cursor >= len(expected):
-        return apply_refinement(rows, verified)
-
-    total = len(timeline.semantic_raw_positions)
-    raw_start = timeline.semantic_raw_positions[cursor]
-    fallback_texts: list[str] = []
-    for boundary in sorted(
-        {point for point in timeline.preferred_boundaries if point > cursor} | {total}
-    ):
-        raw_end = (
-            len(timeline.raw_text)
-            if boundary >= total
-            else timeline.semantic_raw_positions[boundary]
-        )
-        text = timeline.raw_text[raw_start:raw_end].strip()
-        if text:
-            fallback_texts.append(text)
-        raw_start = raw_end
-    if not fallback_texts:
-        raise RefinementError("无法恢复 AI 错误位置之后的原断句")
-    return apply_refinement(rows, [*verified, *fallback_texts])
-
-
 def build_prompt(rows: list[dict], corrective: bool = False) -> str:
     input_lines = []
     for index, row in enumerate(rows, start=1):
-        item = {
-            "id": index,
-            "start": round(float(row.get("start", 0.0)), 3),
-            "end": round(float(row.get("end", 0.0)), 3),
-            "text": str(row.get("message", "")),
-        }
-        if row.get("words"):
-            item["words"] = [
-                {
-                    "text": str(word.get("word", word.get("text", ""))),
-                    "start": round(float(word.get("start", 0.0)), 3),
-                    "end": round(float(word.get("end", 0.0)), 3),
-                }
-                for word in row["words"]
-                if isinstance(word, dict)
-            ]
-        input_lines.append(json.dumps(item, ensure_ascii=False))
+        item = [
+            index,
+            round(float(row.get("start", 0.0)), 3),
+            round(float(row.get("end", 0.0)), 3),
+            str(row.get("message", row.get("text", "")) or ""),
+        ]
+        input_lines.append(json.dumps(
+            item, ensure_ascii=False, separators=(",", ":")
+        ))
     correction = (
-        "上一次输出改变或遗漏了原文。这次必须确保所有 text 去掉标点和空白后，"
-        "按顺序连接起来与输入完全相同。\n"
+        "上一次输出的范围无效。这次必须从 1 开始连续覆盖到最后一个 id，"
+        "不能遗漏、重复、交叉或越界。\n"
         if corrective else ""
     )
-    return f"""你是字幕断句整理器。请理解整份识别原文，只重新安排字幕边界：
-1. 可以合并相邻碎句，也可以拆分一条过长字幕；不要翻译、纠错、改写、遗漏、重复或调换任何词。
-2. 简短语气词（例如“嗯”“啊”）是否独立由语义决定，不要机械并入下一句。
-3. 单条尽量不超过 {MAX_EFFECTIVE_CHARS} 个字符或 {MAX_DURATION_SECONDS:g} 秒，不要跨越超过 {MAX_SILENCE_GAP_SECONDS:g} 秒的静音。
-4. 仅输出 JSON Lines，每行一个 {{"text":"重新分组后的原文"}}，不要输出编号、解释或 Markdown。
-{correction}输入 JSON Lines：
+    return f"""你是字幕断句整理器。请理解整份识别原文，自主决定哪些相邻输入行应合为一句：
+1. 以语义、语气和上下文为准，把相邻碎句整理成自然、完整的字幕句子；不要翻译、纠错、改写或复述原文。
+2. 简短语气词、停顿和较长句是否独立都由你根据全文语义决定，不设机械的字符数、时长或静音限制。
+3. 仅输出 JSON Lines，每组一行 {{"start_id":起始行号,"end_id":结束行号}}；第一组必须从 1 开始，后一组紧接前一组，最后一组必须结束于 {len(rows)}。
+4. 不要输出原文、解释、Markdown 或任何其他字段。
+{correction}输入 JSON Lines，每行格式为 [id,开始秒,结束秒,原文]：
 {chr(10).join(input_lines)}"""
 
 
@@ -426,6 +365,11 @@ def request_openai_compatible(
     proxy: str = "",
     cancel_token: CancellationToken,
     thinking_enabled: bool = False,
+    output_callback: Callable[[dict], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    max_output_characters: int = DEFAULT_MAX_OUTPUT_CHARACTERS,
+    expected_last_id: int | None = None,
 ) -> str:
     if not endpoint or not model or not api_key:
         raise RefinementError("AI 断句缺少 API 地址、模型名称或 Token")
@@ -435,7 +379,10 @@ def request_openai_compatible(
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "stream": True,
-        "max_tokens": 384000 if model.lower().startswith("deepseek-v4") else 65536,
+        "max_tokens": max(1, min(
+            int(max_output_tokens),
+            384000 if model.lower().startswith("deepseek-v4") else 65536,
+        )),
     }
     model_lower = model.lower()
     if model_lower.startswith("deepseek-v4"):
@@ -454,30 +401,108 @@ def request_openai_compatible(
     client_kwargs["trust_env"] = False
     timeout = httpx.Timeout(connect=10, read=5, write=30, pool=10)
     chunks: list[str] = []
+    request_id = uuid.uuid4().hex
+    received_characters = 0
+    last_report = -1
+    last_report_at = time.monotonic()
+    range_line_buffer = ""
+    contiguous_end_id = 0
+    last_progress_id = 0
+    last_progress_at = time.monotonic()
+
+    def report(total: int, *, final=False):
+        if output_callback is None:
+            return
+        output_callback({
+            "request": request_id,
+            "characters": max(0, int(total)),
+            "final": bool(final),
+        })
+
     cancel_token.raise_if_cancelled()
-    with httpx.Client(timeout=timeout, **client_kwargs) as client:
-        with client.stream(
-            "POST",
-            base_url + "/chat/completions",
-            headers=headers,
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                cancel_token.raise_if_cancelled()
-                if not line or line.startswith(":") or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                    delta = event.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content")
-                    if isinstance(content, str):
-                        chunks.append(content)
-                except (json.JSONDecodeError, IndexError, AttributeError):
-                    continue
+    try:
+        with httpx.Client(timeout=timeout, **client_kwargs) as client:
+            with client.stream(
+                "POST",
+                base_url + "/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    cancel_token.raise_if_cancelled()
+                    if not line or line.startswith(":") or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                        delta = event.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content")
+                        response_complete = False
+                        if isinstance(content, str):
+                            chunks.append(content)
+                            received_characters += len(content)
+                            if received_characters > max_output_characters:
+                                raise RefinementError(
+                                    "AI 断句输出异常增长，已提前中止"
+                                )
+                            if expected_last_id:
+                                range_line_buffer += content
+                                lines = range_line_buffer.split("\n")
+                                range_line_buffer = lines.pop()
+                                for completed_line in lines:
+                                    try:
+                                        item = json.loads(completed_line.strip())
+                                    except json.JSONDecodeError:
+                                        continue
+                                    record = _range_record(item)
+                                    if record is None:
+                                        continue
+                                    start_id, end_id = record
+                                    if (
+                                        start_id != contiguous_end_id + 1
+                                        or end_id < start_id
+                                        or end_id > expected_last_id
+                                    ):
+                                        contiguous_end_id = -1
+                                        continue
+                                    contiguous_end_id = end_id
+                                    progress_now = time.monotonic()
+                                    progress_step = max(1, expected_last_id // 100)
+                                    if (
+                                        progress_callback is not None
+                                        and (
+                                            end_id - last_progress_id >= progress_step
+                                            or progress_now - last_progress_at >= 0.2
+                                            or end_id == expected_last_id
+                                        )
+                                    ):
+                                        progress_callback(end_id, expected_last_id)
+                                        last_progress_id = end_id
+                                        last_progress_at = progress_now
+                                    if end_id == expected_last_id:
+                                        response_complete = True
+                                        break
+                        now = time.monotonic()
+                        if (
+                            received_characters > 0
+                            and (
+                                last_report < 0
+                                or received_characters - last_report >= 32
+                                or now - last_report_at >= 0.2
+                            )
+                        ):
+                            report(received_characters)
+                            last_report = received_characters
+                            last_report_at = now
+                        if response_complete:
+                            break
+                    except (json.JSONDecodeError, IndexError, AttributeError):
+                        continue
+    finally:
+        report(received_characters, final=True)
     return "".join(chunks)
 
 
@@ -491,30 +516,33 @@ class SentenceRefiner:
         self.requester = requester
         self.cancel_token = cancel_token
         self.status = status or (lambda _message: None)
+        self.applied = False
+        self.changed = False
+        self.last_error = ""
 
     def refine(self, rows: list[dict]) -> list[dict]:
         original = [dict(row) for row in rows]
+        self.applied = False
+        self.changed = False
+        self.last_error = ""
         for attempt in range(2):
             self.cancel_token.raise_if_cancelled()
-            texts: list[str] = []
             try:
                 response = self.requester(build_prompt(rows, corrective=bool(attempt)))
-                texts = _extract_jsonline_texts(response)
-                refined = apply_refinement(rows, texts)
+                ranges = _extract_group_ranges(response, len(rows))
+                unchanged = all(
+                    start_id == index and end_id == index
+                    for index, (start_id, end_id) in enumerate(ranges, start=1)
+                )
+                refined = original if unchanged else apply_group_ranges(rows, ranges)
+                self.applied = True
+                self.changed = not unchanged
                 self.status(f"AI 断句完成：{len(rows)} 条整理为 {len(refined)} 条")
                 return refined
             except TaskCancelledError:
                 raise
             except Exception as error:
+                self.last_error = str(error)
                 self.status(f"AI 断句第 {attempt + 1} 次响应无效：{error}")
-                if attempt == 1 and texts:
-                    try:
-                        refined = apply_partial_refinement(rows, texts)
-                        self.status(
-                            "AI 断句仅部分有效，已从首个错误处恢复原断句"
-                        )
-                        return refined
-                    except RefinementError:
-                        pass
-        self.status("AI 断句失败，已安全保留原断句")
+        self.status("AI 断句未完整覆盖原文，本次结果未应用，已保留全部原断句")
         return original

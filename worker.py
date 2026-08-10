@@ -10,7 +10,7 @@ from pathlib import Path
 import requests
 import httpx
 import yaml
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Slot
 
 import asrlabs_bridge
 import crispasr_bridge
@@ -35,6 +35,7 @@ from srt2prompt import make_prompt, merge_srt_files
 from sentence_refiner import (
     SentenceRefiner,
     crispasr_json_rows,
+    resegment_request_limits,
     request_openai_compatible,
 )
 from yt_dlp import YoutubeDL
@@ -50,8 +51,10 @@ def error_handler(func):
         try:
             func(self)
         except TaskCancelledError:
+            self._task_outcome = "cancelled"
             self._emit_status(_("status_cancel_done"))
         except Exception as e:
+            self._task_outcome = "error"
             self._emit_status(_("status_generic_error", error=e))
         finally:
             self._finalize_task()
@@ -59,6 +62,7 @@ def error_handler(func):
     return wrapper
 class MainWorker(QObject):
     finished = Signal()
+    outcome = Signal(str)
     status = Signal(str)
     show_model_dialog = Signal(list)
 
@@ -75,7 +79,27 @@ class MainWorker(QObject):
         self._stop_requested = False
         self._stop_event = cancel_token.event
         self._finished_once = False
+        self._task_outcome = "success"
         self._task_asr_config = dict(self.config.get('asr_config', {}))
+        self._progress_lock = threading.Lock()
+        self._stage_sequence = 0
+        self._stage_context: dict[int, tuple[str, int]] = {}
+        self._completed_file_ids: set[str] = set()
+        self._failed_file_ids: set[str] = set()
+        self._translation_item_stages: dict[str, int] = {}
+        self._file_progress_total = 0
+
+    @Slot()
+    def execute(self):
+        """Qt slot that dispatches the snapshot operation in the worker thread."""
+        operation = self.config.operation
+        handler = getattr(self, operation, None)
+        if not callable(handler):
+            self._task_outcome = "error"
+            self._emit_status(_("status_generic_error", error=f"Unknown operation: {operation}"))
+            self._finalize_task()
+            return
+        handler()
 
     def _finalize_task(self):
         if self._finished_once:
@@ -87,12 +111,108 @@ class MainWorker(QObject):
         except Exception:
             pass
         self._process_registry.terminate_all()
+        self.outcome.emit(self._task_outcome)
         self.finished.emit()
 
     def _emit_status(self, msg: str):
         """同时向统一消息队列和窗口标题发送状态消息"""
         self.msg_queue.put("status", msg)
         self.status.emit(msg)
+
+    def _emit_file_progress(self, completed: int, total: int, *, visible=True):
+        """Publish whole-file completion independently from stage progress."""
+        total = max(0, int(total))
+        completed = max(0, min(total, int(completed))) if total else 0
+        event = {
+            "kind": "files",
+            "completed": completed,
+            "total": total,
+            "visible": bool(visible and total > 0),
+        }
+        self.msg_queue.put("progress", json.dumps(event, ensure_ascii=False))
+
+    def _set_file_progress_total(self, total: int):
+        with self._progress_lock:
+            self._file_progress_total = max(0, int(total))
+            self._completed_file_ids.clear()
+            self._failed_file_ids.clear()
+            completed = 0
+            file_total = self._file_progress_total
+        self._emit_file_progress(completed, file_total)
+
+    def _complete_file(self, file_id: object):
+        """Count a source file once, only after its complete pipeline succeeds."""
+        key = str(file_id)
+        with self._progress_lock:
+            if key in self._completed_file_ids:
+                return
+            self._completed_file_ids.add(key)
+            completed = len(self._completed_file_ids)
+            total = self._file_progress_total
+        self._emit_file_progress(completed, total)
+
+    def _translation_task_finished(
+        self, file_id: object, outcome: str, completes_file: bool
+    ):
+        key = str(file_id)
+        if outcome != 'success':
+            with self._progress_lock:
+                self._failed_file_ids.add(key)
+            return
+        with self._progress_lock:
+            failed = key in self._failed_file_ids
+        if completes_file and not failed:
+            self._complete_file(key)
+
+    def _complete_file_if_translation_succeeded(self, file_id: object):
+        key = str(file_id)
+        with self._progress_lock:
+            failed = key in self._failed_file_ids
+        if not failed:
+            self._complete_file(key)
+
+    def _translation_item_progress(
+        self, tf_dict: dict, current: int, total: int
+    ):
+        file_id = str(tf_dict.get('source_file_id', '') or '')
+        if not file_id:
+            return
+        with self._progress_lock:
+            stage_id = self._translation_item_stages.get(file_id)
+        if stage_id is not None:
+            self._update_stage(stage_id, current, total)
+
+    def _begin_stage(self, phase: str, total: int = 1) -> int:
+        """Create a unique stage and publish its mandatory zero starting point."""
+        total = max(1, int(total))
+        with self._progress_lock:
+            self._stage_sequence += 1
+            stage_id = self._stage_sequence
+            self._stage_context[stage_id] = (str(phase), total)
+        self._update_stage(stage_id, 0, total)
+        return stage_id
+
+    def _update_stage(self, stage_id: int, current: int, total: int | None = None):
+        with self._progress_lock:
+            context = self._stage_context.get(int(stage_id))
+        if context is None:
+            return
+        phase, original_total = context
+        total = max(1, int(total if total is not None else original_total))
+        event = {
+            "kind": "stage",
+            "stage_id": int(stage_id),
+            "current": max(0, min(total, int(current))),
+            "total": total,
+            "phase": str(phase),
+        }
+        self.msg_queue.put("progress", json.dumps(event, ensure_ascii=False))
+
+    def _finish_stage(self, stage_id: int):
+        with self._progress_lock:
+            context = self._stage_context.get(int(stage_id))
+        if context is not None:
+            self._update_stage(stage_id, context[1], context[1])
 
     def _start_process(self, args, label=None):
         proc = self._process_registry.popen(
@@ -191,11 +311,11 @@ class MainWorker(QObject):
             'follows_main': False,
         }
 
-    def _maybe_refine_json(self, json_path: str) -> list[dict]:
+    def _maybe_refine_json(self, json_path: str) -> bool:
         with open(json_path, 'r', encoding='utf-8') as stream:
             rows = json.load(stream)
         if not self.config.get('enable_ai_resegment', False) or not rows:
-            return rows
+            return False
 
         profile = self._resolve_online_profile('ai_resegment')
         provider = str(profile['provider'])
@@ -204,8 +324,10 @@ class MainWorker(QObject):
             and ('sakura' in provider.lower() or 'llamacpp' in provider.lower())
         ):
             self._emit_status(_("status_ai_resegment_unsupported"))
-            return rows
+            return False
         self._emit_status(_("status_ai_resegment_start", count=len(rows)))
+        stage_id = self._begin_stage(_("progress_phase_resegment"), len(rows))
+        max_output_tokens, max_output_characters = resegment_request_limits(rows)
 
         def requester(prompt: str) -> str:
             return request_openai_compatible(
@@ -218,6 +340,15 @@ class MainWorker(QObject):
                 thinking_enabled=bool(
                     self.config.get('ai_resegment_thinking', False)
                 ),
+                output_callback=lambda event: self.msg_queue.put(
+                    "characters", json.dumps(event, ensure_ascii=False)
+                ),
+                progress_callback=lambda current, total: self._update_stage(
+                    stage_id, current, total
+                ),
+                max_output_tokens=max_output_tokens,
+                max_output_characters=max_output_characters,
+                expected_last_id=len(rows),
             )
 
         refiner = SentenceRefiner(
@@ -226,12 +357,23 @@ class MainWorker(QObject):
             status=lambda message: self.msg_queue.put('detail', f"[AI断句] {message}"),
         )
         refined = refiner.refine(rows)
+        if not refiner.applied:
+            self._emit_status(_(
+                "status_ai_resegment_failed",
+                error=refiner.last_error or "unknown response error",
+            ))
+            return False
+        if not refiner.changed:
+            self._finish_stage(stage_id)
+            self._emit_status(_("status_ai_resegment_unchanged"))
+            return False
         temp_path = json_path + '.resegment.tmp'
         with open(temp_path, 'w', encoding='utf-8') as stream:
             json.dump(refined, stream, ensure_ascii=False, indent=2)
         os.replace(temp_path, json_path)
+        self._finish_stage(stage_id)
         self._emit_status(_("status_ai_resegment_done", count=len(refined)))
-        return refined
+        return True
 
     def _combine_transcribed_segments(
         self,
@@ -432,6 +574,7 @@ class MainWorker(QObject):
     @error_handler
     def test_online_api(self):
         self._stop_requested = False
+        self._emit_file_progress(0, 0, visible=False)
         translator = self.config.get('translator', '')
         gpt_token = self.config.get('gpt_token', '') or _load_api_key()
         gpt_address = self.config.get('gpt_address', '')
@@ -456,6 +599,7 @@ class MainWorker(QObject):
         else:
             base_url += '/v1/models'
 
+        stage_id = self._begin_stage(_("progress_phase_api"))
         self._emit_status(_("status_api_testing", url=base_url))
         try:
             if proxy_address:
@@ -514,6 +658,7 @@ class MainWorker(QObject):
                 except Exception:
                     body = str(resp)[:500].replace('\n', ' ')
                 self._emit_status(_("status_api_complete_body", url=base_url, body=body))
+            self._finish_stage(stage_id)
         except Exception as e:
             self._emit_status(_("status_api_error", error=e))
 
@@ -528,6 +673,7 @@ class MainWorker(QObject):
         input_files = self.config.get('uvr_input_files', '')
         if input_files:
             input_files = input_files.strip().split('\n')
+            self._set_file_progress_total(len(input_files))
             for idx, input_file in enumerate(input_files):
                 if self._stop_requested:
                     break
@@ -536,9 +682,14 @@ class MainWorker(QObject):
                     return
 
                 self._emit_status(_("status_vocal_split_label", idx=idx+1, total=len(input_files)))
+                stage_id = self._begin_stage(_("progress_phase_separate"))
                 proc = self._start_process([*_SEPARATE_CMD, '-m', os.path.join('separate',uvr_file), input_file])
-                self._process_registry.wait(proc)
+                return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
+                if return_code != 0:
+                    raise RuntimeError(f"separation exited with code {return_code}")
+                self._finish_stage(stage_id)
+                self._complete_file(idx)
 
             self._emit_status(_("status_vocal_processing_done"))
     @error_handler
@@ -579,6 +730,7 @@ class MainWorker(QObject):
         prompt = self.config.get('summarize_prompt', '')
         if input_files:
             input_files = input_files.strip().split('\n')
+            self._set_file_progress_total(len(input_files))
             for idx, input_file in enumerate(input_files):
                 if not os.path.exists(input_file):
                     self._emit_status(_("status_file_not_exist", file=input_file))
@@ -586,10 +738,13 @@ class MainWorker(QObject):
 
                 from summarize import summarize
                 self._emit_status(_("status_summarize_processing", idx=idx+1, total=len(input_files)))
+                stage_id = self._begin_stage(_("progress_phase_summarize"))
                 summarize(
                     input_file, address, model, token, prompt,
                     cancel_token=self.cancel_token,
                 )
+                self._finish_stage(stage_id)
+                self._complete_file(idx)
             self._emit_status(_("status_processing_done"))
     @error_handler
     def synth(self):
@@ -627,6 +782,8 @@ class MainWorker(QObject):
                 self._emit_status(_("status_synth_mismatch"))
                 return
 
+            self._set_file_progress_total(len(video_files))
+
             for idx, (input_file, input_srt) in enumerate(zip(video_files, srt_files)):
                 if self._stop_requested:
                     break
@@ -641,6 +798,7 @@ class MainWorker(QObject):
                 self._emit_status(_("status_synth_processing", file=input_file, idx=idx+1, total=len(video_files)))
 
                 output_file = input_file + '_synth.mp4'
+                stage_id = self._begin_stage(_("progress_phase_synth"))
 
                 if subtitle_type == "硬字幕":
                     input_srt_cache = shutil.copy(input_srt, 'project/cache/')
@@ -655,9 +813,13 @@ class MainWorker(QObject):
                     # Depending on the container and subtitle format, -c:s mov_text works for mp4.
                     proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-i', input_file, '-i', input_srt, '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text', output_file])
 
-                self._process_registry.wait(proc)
+                return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
+                if return_code != 0:
+                    raise RuntimeError(f"ffmpeg exited with code {return_code}")
                 self._emit_status(_("status_synth_done"))
+                self._finish_stage(stage_id)
+                self._complete_file(idx)
 
     @error_handler
     def clip(self):
@@ -667,6 +829,7 @@ class MainWorker(QObject):
         clip_end = self.config.get('clip_end', '')
         if input_files:
             input_files = input_files.strip().split('\n')
+            self._set_file_progress_total(len(input_files))
             for idx, input_file in enumerate(input_files):
                 if self._stop_requested:
                     break
@@ -676,10 +839,15 @@ class MainWorker(QObject):
 
                 self._emit_status(_("status_processing_file", file=input_file, idx=idx+1, total=len(input_files)))
                 self._emit_status(_("status_clip_processing", start=clip_start, end=clip_end))
+                stage_id = self._begin_stage(_("progress_phase_clip"))
                 proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-i', input_file, '-ss', clip_start, '-to', clip_end, '-vcodec', 'libx264', '-acodec', 'aac', os.path.join(*(input_file.split('.')[:-1]))+'_clip.'+input_file.split('.')[-1]])
-                self._process_registry.wait(proc)
+                return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
+                if return_code != 0:
+                    raise RuntimeError(f"ffmpeg exited with code {return_code}")
                 self._emit_status(_("status_clip_done"))
+                self._finish_stage(stage_id)
+                self._complete_file(idx)
     @error_handler
     def audiosynth(self):
         self._stop_requested = False
@@ -691,6 +859,8 @@ class MainWorker(QObject):
             if len(audio_files) != len(image_files):
                 self._emit_status(_("status_audio_mismatch"))
                 return
+
+            self._set_file_progress_total(len(image_files))
 
             for idx, (audio_input, image_input) in enumerate(zip(audio_files, image_files)):
                 if self._stop_requested:
@@ -704,13 +874,20 @@ class MainWorker(QObject):
                     return
 
                 self._emit_status(_("status_processing_file", file=audio_input, idx=idx+1, total=len(image_files)))
+                stage_id = self._begin_stage(_("progress_phase_synth"))
                 proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-loop', '1', '-r', '1', '-f', 'image2', '-i', image_input, '-i', audio_input, '-shortest', '-vcodec', 'libx264', '-acodec', 'aac', audio_input+'_synth.mp4'], label='ffmpeg')
-                self._process_registry.wait(proc)
+                return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
+                if return_code != 0:
+                    raise RuntimeError(f"ffmpeg exited with code {return_code}")
                 self._emit_status(_("status_synth_done"))
+                self._finish_stage(stage_id)
+                self._complete_file(idx)
 
     @error_handler
     def clean(self):
+        self._emit_file_progress(0, 0, visible=False)
+        stage_id = self._begin_stage(_("progress_phase_clean"), 2)
         self._emit_status(_("status_cleaning_intermediate"))
         for path in (
             'project/gt_input',
@@ -720,11 +897,13 @@ class MainWorker(QObject):
             self._raise_if_cancelled()
             if os.path.exists(path):
                 shutil.rmtree(path)
+        self._update_stage(stage_id, 1, 2)
         self._emit_status(_("status_cleaning_output"))
         self._raise_if_cancelled()
         if os.path.exists('project/cache'):
             shutil.rmtree('project/cache')
         os.makedirs('project/cache', exist_ok=True)
+        self._finish_stage(stage_id)
 
     def _process_single_audio(
         self,
@@ -918,6 +1097,7 @@ class MainWorker(QObject):
         output_dir,
         output_format,
         asr_config=None,
+        progress_callback=None,
     ):
         """Faster-Whisper 逐段产出并与在线翻译重叠执行。"""
         from streaming_pipeline import run_streaming_pipeline
@@ -955,6 +1135,7 @@ class MainWorker(QObject):
                 batch_size=batch_size,
                 stop_event=self._stop_event,
                 status=self._emit_status,
+                progress=progress_callback,
             )
         except Exception as error:
             if self._stop_requested or self._stop_event.is_set():
@@ -1209,6 +1390,8 @@ class MainWorker(QObject):
             input_files = input_files.split('\n')
         else:
             input_files = []
+        file_total = len(input_files)
+        self._set_file_progress_total(file_total)
 
         os.makedirs('project/cache', exist_ok=True)
 
@@ -1268,6 +1451,23 @@ class MainWorker(QObject):
             self.config.get('verbose_mode', False)
         )
 
+        translation_stage_lock = threading.Lock()
+        translation_stage_id: int | None = None
+        translation_stage_base = 0
+        translation_stage_total = 0
+
+        def emit_translation_progress(current: int, total: int):
+            with translation_stage_lock:
+                active_stage = translation_stage_id
+                completed_before_stage = translation_stage_base
+                active_total = translation_stage_total
+            if active_stage is not None:
+                self._update_stage(
+                    active_stage,
+                    max(0, current - completed_before_stage),
+                    active_total,
+                )
+
         self._translation_pool = ConcurrentTranslationPool(
             project_dir='project',
             base_config_path='project/config.yaml',
@@ -1275,14 +1475,58 @@ class MainWorker(QObject):
             stop_event=self._stop_event,
             msg_queue=self.msg_queue,
             local_model_config=local_model_config,
+            progress_callback=emit_translation_progress,
+            file_completion_callback=self._translation_task_finished,
+            item_progress_callback=self._translation_item_progress,
         )
         self._translation_pool.start(engine)
+
+        def submit_translation(tf: TranscribedFile):
+            """Show per-sentence progress while serial file translation blocks."""
+            if not self._translation_pool.serial_mode:
+                self._translation_pool.submit(tf)
+                return
+
+            source_total = 1
+            try:
+                with open(tf.json_src, 'r', encoding='utf-8') as stream:
+                    source_rows = json.load(stream)
+                source_total = max(1, sum(
+                    1 for row in source_rows
+                    if isinstance(row, dict)
+                    and str(row.get('message', '') or '').strip()
+                ))
+            except Exception:
+                pass
+            if self.config.get('enable_proofread', False):
+                source_total *= 2
+            stage_id = self._begin_stage(
+                _("progress_phase_translation"), source_total
+            )
+            file_id = str(tf.source_file_id or '')
+            if file_id:
+                with self._progress_lock:
+                    self._translation_item_stages[file_id] = stage_id
+            try:
+                self._translation_pool.submit(tf)
+                with self._progress_lock:
+                    failed = file_id in self._failed_file_ids
+                if not failed:
+                    self._finish_stage(stage_id)
+            finally:
+                if file_id:
+                    with self._progress_lock:
+                        if self._translation_item_stages.get(file_id) == stage_id:
+                            self._translation_item_stages.pop(file_id, None)
 
         # 主线程：顺序执行下载+听写，产出放入队列
         for idx, input_file in enumerate(input_files):
             if self._stop_event.is_set():
                 raise TaskCancelledError()
+            input_stage = self._begin_stage(_("progress_phase_input"))
+            self._finish_stage(input_stage)
             if not os.path.exists(input_file):
+                download_stage = self._begin_stage(_("progress_phase_download"))
                 if input_file.startswith('BV'):
                     self._emit_status(_("status_downloading_video"))
                     res = send_request(URL_VIDEO_INFO, params={'bvid': input_file})
@@ -1333,6 +1577,7 @@ class MainWorker(QObject):
                         self._emit_status(_("status_download_not_found", file=input_file))
                         self._stop_event.set()
                         break
+                self._finish_stage(download_stage)
 
             self._emit_status(_("status_processing_file", file=input_file, idx=idx+1, total=len(input_files)))
             current_output_dir = output_dir
@@ -1347,16 +1592,17 @@ class MainWorker(QObject):
                 self._emit_status(_("status_srt_converting"))
                 json_path = os.path.join(transcribed_dir, os.path.basename(input_file).replace('.srt', '.json'))
                 make_prompt(input_file, json_path)
-                self._maybe_refine_json(json_path)
+                resegment_changed = self._maybe_refine_json(json_path)
                 self._emit_status(_("status_srt_convert_done"))
+                subtitle_stage = self._begin_stage(_("progress_phase_subtitle"))
                 source_base_path = os.path.join(
                     current_output_dir, os.path.basename(input_file[:-4])
                 )
-                if self.config.get('enable_ai_resegment', False):
+                if resegment_changed:
                     source_base_path += '.resegmented'
                 source_srt = source_base_path + '.srt'
                 if output_format in ('原文SRT', '双语SRT'):
-                    if os.path.abspath(source_srt) != os.path.abspath(input_file) or self.config.get('enable_ai_resegment', False):
+                    if os.path.abspath(source_srt) != os.path.abspath(input_file) or resegment_changed:
                         make_srt(json_path, source_srt)
                 # 原文 LRC（双语 LRC 需要）
                 if output_format in ('原文LRC', '双语LRC'):
@@ -1372,7 +1618,9 @@ class MainWorker(QObject):
                         output_dir=current_output_dir,
                         output_format=output_format,
                         orig_srt_path=source_srt,
+                        source_file_id=str(idx),
                     )
+                self._finish_stage(subtitle_stage)
             else:
                 # 音视频输入：提取音频 → 听写（如果已有srt则跳过）
                 if not transcription_enabled:
@@ -1388,12 +1636,13 @@ class MainWorker(QObject):
                 if os.path.exists(existing_srt):
                     self._emit_status(_("status_existing_srt_found", file=existing_srt))
                     make_prompt(existing_srt, json_path)
-                    self._maybe_refine_json(json_path)
+                    resegment_changed = self._maybe_refine_json(json_path)
+                    subtitle_stage = self._begin_stage(_("progress_phase_subtitle"))
 
                     output_base_path = os.path.join(
                         current_output_dir, os.path.basename(base_path)
                     )
-                    if self.config.get('enable_ai_resegment', False):
+                    if resegment_changed:
                         output_base_path = os.path.join(
                             current_output_dir,
                             os.path.basename(base_path) + '.resegmented',
@@ -1402,14 +1651,14 @@ class MainWorker(QObject):
                     # 生成原文 SRT/LRC 输出（与正常听写流程一致）
                     if output_format == '原文SRT' or output_format == '双语SRT':
                         srt_output = output_base_path + '.srt'
-                        if self.config.get('enable_ai_resegment', False) or not os.path.exists(srt_output):
+                        if resegment_changed or not os.path.exists(srt_output):
                             make_srt(json_path, srt_output)
 
                     if output_format == '原文LRC' or output_format == '双语LRC':
                         lrc_output = output_base_path + (
                             '.orig.lrc' if output_format == '双语LRC' else '.lrc'
                         )
-                        if self.config.get('enable_ai_resegment', False) or not os.path.exists(lrc_output):
+                        if resegment_changed or not os.path.exists(lrc_output):
                             make_lrc(json_path, lrc_output)
 
                     self._emit_status(_("status_asr_done_cached"))
@@ -1422,11 +1671,16 @@ class MainWorker(QObject):
                             output_dir=current_output_dir,
                             output_format=output_format,
                             orig_srt_path=output_base_path + '.srt',
+                            source_file_id=str(idx),
                         )
-                        self._translation_pool.submit(tf)
+                        submit_translation(tf)
+                    self._finish_stage(subtitle_stage)
+                    if not need_translate:
+                        self._complete_file(idx)
                     continue
 
                 self._emit_status(_("status_extracting_audio"))
+                audio_stage = self._begin_stage(_("progress_phase_audio"))
                 ffmpeg_proc, _unused = start_named_proc(
                     'ffmpeg_extract',
                     ['ffmpeg/ffmpeg', '-y', '-i', input_file, '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', wav_file]
@@ -1438,6 +1692,7 @@ class MainWorker(QObject):
                 if not os.path.exists(wav_file):
                     self._emit_status(_("status_audio_extract_error"))
                     break
+                self._finish_stage(audio_stage)
 
                 # 检查是否启用分段处理
                 base_path = wav_file[:-8]  # 去掉 .16k.wav
@@ -1455,6 +1710,9 @@ class MainWorker(QObject):
                     and asr_engine == 'faster-whisper'
                     and align_engine == 'none'
                 ):
+                    streaming_stage = self._begin_stage(
+                        _("progress_phase_transcribe"), 100
+                    )
                     self._process_streaming_audio(
                         wav_file,
                         language,
@@ -1463,10 +1721,18 @@ class MainWorker(QObject):
                         current_output_dir,
                         output_format,
                         asr_config,
+                        progress_callback=lambda position: self._update_stage(
+                            streaming_stage,
+                            round(min(100.0, max(0.0, position) * 100.0 / total_duration))
+                            if total_duration > 0 else 0,
+                            100,
+                        ),
                     )
+                    self._finish_stage(streaming_stage)
                     if os.path.exists(wav_file):
                         os.remove(wav_file)
                     tf = None
+                    self._complete_file(idx)
                     continue
                 elif enable_streaming:
                     self._emit_status(_("status_streaming_fallback"))
@@ -1479,6 +1745,7 @@ class MainWorker(QObject):
                     os.makedirs(segment_dir, exist_ok=True)
 
                     # 切分音频
+                    split_stage = self._begin_stage(_("progress_phase_split"))
                     segment_files, _unused = self._split_audio(wav_file, segment_duration_minutes, segment_dir)
                     self._raise_if_cancelled()
 
@@ -1487,10 +1754,14 @@ class MainWorker(QObject):
                         if os.path.exists(wav_file):
                             os.remove(wav_file)
                         break
+                    self._finish_stage(split_stage)
 
                     # 对每个片段进行听写和翻译
                     segment_tfs = []  # 存储每个分段的 TranscribedFile
                     segment_json_paths = []
+                    transcribe_stage = self._begin_stage(
+                        _("progress_phase_transcribe"), len(segment_files)
+                    )
                     for i, segment_file in enumerate(segment_files):
                         if self._stop_event.is_set():
                             raise TaskCancelledError()
@@ -1507,6 +1778,9 @@ class MainWorker(QObject):
                             asr_config,
                         )
                         segment_json_paths.append(segment_json)
+                        self._update_stage(
+                            transcribe_stage, i + 1, len(segment_files)
+                        )
 
                         if self.config.get('enable_ai_resegment', False):
                             continue
@@ -1528,18 +1802,26 @@ class MainWorker(QObject):
                                 output_dir=segment_dir,  # 临时输出到分段目录
                                 output_format=output_format,
                                 orig_srt_path='',
+                                source_file_id=str(idx),
+                                completes_source_file=False,
                             )
-                            self._translation_pool.submit(segment_tf)
+                            submit_translation(segment_tf)
                             segment_tfs.append(segment_tf)
+                    self._finish_stage(transcribe_stage)
 
                     if self.config.get('enable_ai_resegment', False):
                         self._emit_status(_("status_merge_segments"))
+                        merge_stage = self._begin_stage(_("progress_phase_merge"))
                         self._combine_transcribed_segments(
                             segment_json_paths,
                             json_path,
                             threshold_seconds,
                         )
+                        self._finish_stage(merge_stage)
                         self._maybe_refine_json(json_path)
+                        subtitle_stage = self._begin_stage(
+                            _("progress_phase_subtitle")
+                        )
                         final_base = os.path.join(
                             current_output_dir, os.path.basename(base_path)
                         )
@@ -1553,13 +1835,17 @@ class MainWorker(QObject):
                                 ),
                             )
                         if need_translate:
-                            self._translation_pool.submit(TranscribedFile(
+                            submit_translation(TranscribedFile(
                                 base_path=final_base,
                                 json_src=json_path,
                                 output_dir=current_output_dir,
                                 output_format=output_format,
                                 orig_srt_path=final_base + '.srt',
+                                source_file_id=str(idx),
                             ))
+                        else:
+                            self._complete_file(idx)
+                        self._finish_stage(subtitle_stage)
                         if os.path.exists(wav_file):
                             os.remove(wav_file)
                         self._emit_status(_("status_segment_done"))
@@ -1568,15 +1854,25 @@ class MainWorker(QObject):
                     # 等待所有分段翻译完成
                     if need_translate and segment_tfs:
                         self._emit_status(_("status_wait_segments"))
+                        segment_translation_stage = self._begin_stage(
+                            _("progress_phase_translation")
+                        )
                         # Only wait for work submitted so far.  The same pool is
                         # reused by later input files and must not receive its
                         # shutdown sentinels until every producer is finished.
                         self._translation_pool.wait_for_pending()
                         self._raise_if_cancelled()
+                        self._finish_stage(segment_translation_stage)
 
                     # 合并所有片段的翻译结果
                     self._emit_status(_("status_merge_segments"))
+                    merge_stage = self._begin_stage(_("progress_phase_merge"))
                     self._merge_segment_translations(segment_files, segment_tfs, base_path, json_path, current_output_dir, output_format, threshold_seconds)
+                    self._finish_stage(merge_stage)
+                    if need_translate:
+                        self._complete_file_if_translation_succeeded(idx)
+                    else:
+                        self._complete_file(idx)
 
                     self._emit_status(_("status_segment_done"))
 
@@ -1585,6 +1881,9 @@ class MainWorker(QObject):
                 else:
                     # 正常流程（未启用分段）
                     self._emit_status(_("status_asr_in_progress"))
+                    transcribe_stage = self._begin_stage(
+                        _("progress_phase_transcribe")
+                    )
                     self._process_single_audio(
                         wav_file,
                         language,
@@ -1593,9 +1892,13 @@ class MainWorker(QObject):
                         stop_named_proc,
                         asr_config,
                     )
+                    self._finish_stage(transcribe_stage)
                     self._maybe_refine_json(json_path)
 
                     # 生成原文 SRT/LRC 输出
+                    subtitle_stage = self._begin_stage(
+                        _("progress_phase_subtitle")
+                    )
                     if output_format == '原文SRT' or output_format == '双语SRT':
                         srt_output = os.path.join(current_output_dir, os.path.basename(base_path + '.srt'))
                         make_srt(json_path, srt_output)
@@ -1612,6 +1915,7 @@ class MainWorker(QObject):
                         os.remove(wav_file)
 
                     self._emit_status(_("status_asr_done"))
+                    self._finish_stage(subtitle_stage)
 
                     if need_translate:
                         tf = TranscribedFile(
@@ -1620,21 +1924,49 @@ class MainWorker(QObject):
                             output_dir=current_output_dir,
                             output_format=output_format,
                             orig_srt_path='',
+                            source_file_id=str(idx),
                         )
 
             if need_translate and tf is not None:
-                self._translation_pool.submit(tf)
+                submit_translation(tf)
+            elif not need_translate:
+                self._complete_file(idx)
 
         # 发送哨兵，等待翻译线程结束
         self._raise_if_cancelled()
         self._emit_status(_("status_all_transcribed"))
+        submitted_translations = self._translation_pool.submitted_count
+        completed_before_wait = self._translation_pool.progress_completed_count
+        remaining_translations = max(
+            0, submitted_translations - completed_before_wait
+        )
+        if remaining_translations:
+            new_translation_stage = self._begin_stage(
+                _("progress_phase_translation"), remaining_translations
+            )
+            with translation_stage_lock:
+                translation_stage_id = new_translation_stage
+                translation_stage_base = completed_before_wait
+                translation_stage_total = remaining_translations
+            self._update_stage(
+                new_translation_stage,
+                max(
+                    0,
+                    self._translation_pool.progress_completed_count
+                    - completed_before_wait,
+                ),
+                remaining_translations,
+            )
         self._translation_pool.done()
         self._translation_pool.wait_all()
         self._raise_if_cancelled()
+        if remaining_translations:
+            self._finish_stage(new_translation_stage)
         self._translation_pool.stop()
 
         err_count = self._translation_pool.error_count
         if err_count > 0:
+            self._task_outcome = "error"
             self._emit_status(_("status_translate_fail_count", count=err_count))
 
         # All producers have joined; FIFO ordering keeps completion last.

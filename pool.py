@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import queue
 import shutil
 import subprocess
@@ -9,11 +10,13 @@ from pathlib import Path
 from time import monotonic, sleep, time
 
 import requests
+import yaml
 
 from core import _TRANSLATE_CMD
 from i18n import _
 from log import (
     UIMessageQueue,
+    _TRANSLATION_LINE_RE,
     _TranslationLogParser,
     _clean_control_chars,
     _stream_proc_to_queue,
@@ -22,6 +25,7 @@ from log import (
 from prompt2srt import make_lrc, make_srt, merge_lrc_files
 from srt2prompt import merge_srt_files
 from tasking import CancellationToken, ProcessRegistry, TaskCancelledError
+from output_metrics import decode_output_event
 
 
 @dataclass
@@ -32,6 +36,8 @@ class TranscribedFile:
     output_dir: str      # 该文件的输出目录
     output_format: str   # 输出格式（如 '目标SRT', '双语SRT'）
     orig_srt_path: str   # 原始 SRT 路径（用于双语合并，空串表示无）
+    source_file_id: str = ""  # 非空时，成功生成最终输出后回报源文件完成
+    completes_source_file: bool = True
 
 
 class ConcurrentTranslationPool:
@@ -42,7 +48,8 @@ class ConcurrentTranslationPool:
     @staticmethod
     def _translate_worker_thread(task_queue, result_queue, msg_queue, stop_event,
                                  project_dir, base_config_path, engine, worker_idx,
-                                 process_registry):
+                                 process_registry, completion_callback=None,
+                                 item_progress_callback=None):
         """工作线程函数：从队列取任务并执行翻译"""
         while not stop_event.is_set():
             try:
@@ -56,29 +63,60 @@ class ConcurrentTranslationPool:
 
             if stop_event.is_set():
                 result_queue.put(('stopped', worker_idx))
+                if completion_callback:
+                    completion_callback(tf_dict, 'stopped')
                 continue
 
             # 执行翻译
             try:
                 ConcurrentTranslationPool._translate_one_impl(
                     tf_dict, worker_idx, project_dir, base_config_path, engine,
-                    msg_queue, stop_event, process_registry)
+                    msg_queue, stop_event, process_registry,
+                    item_progress_callback)
                 result_queue.put(('success', worker_idx))
+                if completion_callback:
+                    completion_callback(tf_dict, 'success')
             except TaskCancelledError:
                 result_queue.put(('stopped', worker_idx))
+                if completion_callback:
+                    completion_callback(tf_dict, 'stopped')
                 break
             except Exception as e:
                 result_queue.put(('error', worker_idx, str(e)))
+                if completion_callback:
+                    completion_callback(tf_dict, 'error')
 
     @staticmethod
     def _translate_one_impl(tf_dict, worker_idx, project_dir, base_config_path,
-                            engine, msg_queue, stop_event, process_registry):
+                            engine, msg_queue, stop_event, process_registry,
+                            item_progress_callback=None):
         """在线程中执行单个文件的翻译"""
         base_path = tf_dict['base_path']
         json_src = tf_dict['json_src']
         output_dir = tf_dict['output_dir']
         output_format = tf_dict['output_format']
         orig_srt_path = tf_dict['orig_srt_path']
+
+        source_total = 1
+        try:
+            with open(json_src, 'r', encoding='utf-8') as stream:
+                source_rows = json.load(stream)
+            source_total = max(1, sum(
+                1 for row in source_rows
+                if isinstance(row, dict) and str(row.get('message', '') or '').strip()
+            ))
+        except Exception:
+            pass
+        proofread_enabled = False
+        try:
+            with open(base_config_path, 'r', encoding='utf-8') as stream:
+                common = (yaml.safe_load(stream) or {}).get('common', {})
+            proofread_enabled = bool(common.get('gpt.enableProofRead', False))
+        except Exception:
+            pass
+        progress_total = source_total * (2 if proofread_enabled else 1)
+        if item_progress_callback:
+            item_progress_callback(tf_dict, 0, progress_total)
 
         base = os.path.basename(base_path)
 
@@ -128,6 +166,8 @@ class ConcurrentTranslationPool:
             reader = threading.Thread(target=read_stdout, daemon=True)
             reader.start()
             reader_done = False
+            progress_entry_id = None
+            progress_occurrences: dict[int, int] = {}
             while not reader_done or not line_queue.empty():
                 if stop_event.is_set():
                     process_registry.terminate(proc)
@@ -142,6 +182,34 @@ class ConcurrentTranslationPool:
                     reader_done = True
                     continue
                 cleaned = _clean_control_chars(_strip_ansi(line.rstrip('\n\r')))
+                header_match = _TRANSLATION_LINE_RE.match(cleaned)
+                if header_match:
+                    progress_entry_id = int(header_match.group(1))
+                elif cleaned.startswith('> Dst: ') and progress_entry_id is not None:
+                    seen = progress_occurrences.get(progress_entry_id, 0)
+                    max_occurrences = 2 if proofread_enabled else 1
+                    if seen < max_occurrences:
+                        progress_occurrences[progress_entry_id] = seen + 1
+                        if item_progress_callback:
+                            completed_units = min(
+                                progress_total,
+                                sum(progress_occurrences.values()),
+                            )
+                            # Keep 100% for the point where final subtitle files
+                            # have actually been written below.
+                            item_progress_callback(
+                                tf_dict,
+                                min(completed_units, max(0, progress_total - 1)),
+                                progress_total,
+                            )
+                    progress_entry_id = None
+                output_event = decode_output_event(cleaned)
+                if output_event is not None:
+                    msg_queue.put(
+                        "characters",
+                        json.dumps(output_event, ensure_ascii=False),
+                    )
+                    continue
                 if cleaned:
                     for output_line in _trans_parser.feed(cleaned):
                         if output_line.strip():
@@ -169,6 +237,9 @@ class ConcurrentTranslationPool:
         send_status(_("status_translating_srt", idx=worker_idx, base=base))
         ConcurrentTranslationPool._generate_output_impl(
             json_src, base_path, output_dir, output_format, workspace, orig_srt_path)
+
+        if item_progress_callback:
+            item_progress_callback(tf_dict, progress_total, progress_total)
 
         send_status(_("status_translating_done", idx=worker_idx, base=base))
 
@@ -241,7 +312,8 @@ class ConcurrentTranslationPool:
                 os.remove(left)
 
     def __init__(self, project_dir, base_config_path, max_concurrent, stop_event,
-                 msg_queue, local_model_config=None):
+                 msg_queue, local_model_config=None, progress_callback=None,
+                 file_completion_callback=None, item_progress_callback=None):
         """
         msg_queue: 统一消息队列（UIMessageQueue 实例）
         local_model_config: 本地模型配置，用于多线程本地模型翻译
@@ -264,6 +336,11 @@ class ConcurrentTranslationPool:
         self._error_lock = threading.Lock()
         self._submitted_count = 0
         self._completed_count = 0
+        self._progress_completed_count = 0
+        self._progress_lock = threading.Lock()
+        self._progress_callback = progress_callback
+        self._file_completion_callback = file_completion_callback
+        self._item_progress_callback = item_progress_callback
         # 本地模型相关（所有进程共享一个本地模型）
         self._shared_local_model_proc = None
         self._shared_local_model_port = None
@@ -278,6 +355,35 @@ class ConcurrentTranslationPool:
     def error_count(self):
         with self._error_lock:
             return self._error_count
+
+    @property
+    def submitted_count(self):
+        with self._progress_lock:
+            return self._submitted_count
+
+    @property
+    def progress_completed_count(self):
+        with self._progress_lock:
+            return self._progress_completed_count
+
+    @property
+    def serial_mode(self):
+        return self._serial_mode
+
+    def _notify_progress_completion(self, tf_dict=None, outcome='success'):
+        with self._progress_lock:
+            self._progress_completed_count += 1
+            current = self._progress_completed_count
+            total = max(current, self._submitted_count)
+        if self._progress_callback:
+            self._progress_callback(current, total)
+        source_file_id = str((tf_dict or {}).get('source_file_id', '') or '')
+        if source_file_id and self._file_completion_callback:
+            self._file_completion_callback(
+                source_file_id,
+                outcome,
+                bool((tf_dict or {}).get('completes_source_file', True)),
+            )
 
     def start(self, engine):
         """启动 N 个工作线程"""
@@ -306,7 +412,9 @@ class ConcurrentTranslationPool:
                 target=ConcurrentTranslationPool._translate_worker_thread,
                 args=(self._task_queue, self._result_queue, self._msg_queue,
                       self._stop_event, self._project_dir, self._base_config_path,
-                      engine, i, self._process_registry),
+                      engine, i, self._process_registry,
+                      self._notify_progress_completion,
+                      self._item_progress_callback),
                 daemon=True
             )
             self._active_threads.append(t)
@@ -338,19 +446,25 @@ class ConcurrentTranslationPool:
                     'output_dir': tf.output_dir,
                     'output_format': tf.output_format,
                     'orig_srt_path': tf.orig_srt_path,
+                    'source_file_id': tf.source_file_id,
+                    'completes_source_file': tf.completes_source_file,
                 }
+                outcome = 'success'
                 try:
                     ConcurrentTranslationPool._translate_one_impl(
                         tf_dict, 0, self._project_dir, self._base_config_path,
                         self._engine, self._msg_queue, self._stop_event,
-                        self._process_registry)
+                        self._process_registry, self._item_progress_callback)
                 except Exception as e:
+                    outcome = 'error'
                     with self._error_lock:
                         self._error_count += 1
                     self._msg_queue.put("status", _("status_translation_fail", error=e))
 
-                self._submitted_count += 1
+                with self._progress_lock:
+                    self._submitted_count += 1
                 self._completed_count += 1
+                self._notify_progress_completion(tf_dict, outcome)
 
                 # 停止共享本地模型
                 self._stop_shared_local_model()
@@ -362,8 +476,11 @@ class ConcurrentTranslationPool:
                 'output_dir': tf.output_dir,
                 'output_format': tf.output_format,
                 'orig_srt_path': tf.orig_srt_path,
+                'source_file_id': tf.source_file_id,
+                'completes_source_file': tf.completes_source_file,
             }
-            self._submitted_count += 1
+            with self._progress_lock:
+                self._submitted_count += 1
             self._task_queue.put(tf_dict)
 
     def _record_result(self, result):

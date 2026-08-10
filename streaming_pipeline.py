@@ -20,6 +20,7 @@ from typing import Callable, Iterable
 
 
 StatusCallback = Callable[[str], None]
+ProgressCallback = Callable[[float], None]
 
 
 @dataclass
@@ -285,9 +286,11 @@ def run_streaming_pipeline(
     batch_size: int,
     stop_event,
     status: StatusCallback | None = None,
+    progress: ProgressCallback | None = None,
 ) -> StreamingPipelineResult:
     """运行一次增量识别翻译流程。仅支持 Faster-Whisper。"""
     status = status or (lambda _message: None)
+    progress = progress or (lambda _position: None)
     started = time.monotonic()
     _activate_cuda_dll_dirs()
     from faster_whisper import WhisperModel
@@ -339,6 +342,7 @@ def run_streaming_pipeline(
                 "message": text,
             }
             source_rows.append(item)
+            progress(item["end"])
             pending.append(item)
             _atomic_write_json(source_json, source_rows)
             status(
