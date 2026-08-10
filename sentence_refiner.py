@@ -425,6 +425,7 @@ def request_openai_compatible(
     api_key: str,
     proxy: str = "",
     cancel_token: CancellationToken,
+    thinking_enabled: bool = False,
 ) -> str:
     if not endpoint or not model or not api_key:
         raise RefinementError("AI 断句缺少 API 地址、模型名称或 Token")
@@ -436,8 +437,18 @@ def request_openai_compatible(
         "stream": True,
         "max_tokens": 384000 if model.lower().startswith("deepseek-v4") else 65536,
     }
-    if "api.deepseek.com" in base_url.lower() and model.lower().startswith("deepseek-v4"):
-        payload["thinking"] = {"type": "disabled"}
+    model_lower = model.lower()
+    if model_lower.startswith("deepseek-v4"):
+        payload["thinking"] = {
+            "type": "enabled" if thinking_enabled else "disabled"
+        }
+    elif "qwen3" in model_lower or "qwq" in model_lower:
+        payload["enable_thinking"] = bool(thinking_enabled)
+    elif re.search(
+        r"(^|[-_/:.])(?:r1|o1|o3|o4)(?:[-_/:.]|$)|reason",
+        model_lower,
+    ):
+        payload["reasoning_effort"] = "high" if thinking_enabled else "low"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     client_kwargs = build_httpx_sync_proxy_kwargs(proxy or None)
     client_kwargs["trust_env"] = False

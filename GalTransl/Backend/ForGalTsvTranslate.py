@@ -136,6 +136,10 @@ class ForGalTsvTranslate(BaseTranslate):
                 file_name=f"{filename}:{idx_tip}",
                 base_try_count=retry_count,
                 stream_line_callback=_parse_stream_lines,
+                model_override=(
+                    self.proofread_model_name if proofread else NOT_GIVEN
+                ),
+                use_proofread_profile=proofread,
             )
 
             result_text = resp or ""
@@ -171,7 +175,7 @@ class ForGalTsvTranslate(BaseTranslate):
                     parse_ok, parse_error = self._parse_tsv_result_line(
                         line,
                         trans_list,
-                        getattr(token, "model_name", ""),
+                        getattr(self, "_last_chatbot_model_name", ""),
                         n_symbol,
                         {"i": i, "success_count": success_count},
                         result_trans_list,
@@ -201,7 +205,7 @@ class ForGalTsvTranslate(BaseTranslate):
                         filename=filename,
                         index_range=idx_tip,
                         retry_count=retry_count + 1,
-                        model=getattr(token, "model_name", ""),
+                        model=getattr(self, "_last_chatbot_model_name", ""),
                         level="warning",
                     )
                 except Exception:
@@ -243,7 +247,7 @@ class ForGalTsvTranslate(BaseTranslate):
                         trans_list,
                         0 if i < 0 else i,
                         result_trans_list,
-                        getattr(token, "model_name", ""),
+                        getattr(self, "_last_chatbot_model_name", ""),
                         proofread=proofread,
                         translate_failed_prefix="(Failed)",
                         translate_problem_message="翻译失败",

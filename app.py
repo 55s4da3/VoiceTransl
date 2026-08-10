@@ -13,6 +13,8 @@ from core import (
     LOG_PATH,
     NO_TRANSCRIPTION,
     NO_TRANSLATION,
+    ONLINE_TRANSLATOR_MAPPING,
+    model_supports_thinking,
     TRANSLATOR_SUPPORTED,
     _compose_output_format,
     _load_api_key,
@@ -293,6 +295,15 @@ class MainWindow(QMainWindow):
         gpt_token = self.gpt_token.text()
         gpt_address = self.gpt_address.text()
         gpt_model = self.gpt_model.text()
+        ai_resegment_model = self._auxiliary_model_value(
+            self.ai_resegment_model_combo
+        )
+        proofread_model = self._auxiliary_model_value(self.proofread_model_combo)
+        api_tokens = {
+            'VOICETRANSL_API_KEY': gpt_token,
+            'VOICETRANSL_RESEGMENT_API_KEY': self.ai_resegment_token.text(),
+            'VOICETRANSL_PROOFREAD_API_KEY': self.proofread_token.text(),
+        }
         sakura_file = self.sakura_file.currentText()
         sakura_mode = self.sakura_mode.text()
         proxy_address = self.proxy_address.text()
@@ -331,6 +342,15 @@ class MainWindow(QMainWindow):
             'language': language,
             'gpt_address': gpt_address,
             'gpt_model': gpt_model,
+            'ai_resegment_model': ai_resegment_model,
+            'ai_resegment_provider': self.ai_resegment_provider_combo.currentData() or 'follow',
+            'ai_resegment_address': self.ai_resegment_address.text().strip(),
+            'proofread_model': proofread_model,
+            'proofread_provider': self.proofread_provider_combo.currentData() or 'follow',
+            'proofread_address': self.proofread_address.text().strip(),
+            'deepseek_thinking': self.deepseek_thinking_checkbox.isChecked(),
+            'ai_resegment_thinking': self.ai_resegment_thinking_checkbox.isChecked(),
+            'proofread_thinking': self.proofread_thinking_checkbox.isChecked(),
             'sakura_file': sakura_file,
             'sakura_mode': sakura_mode,
             'proxy_address': proxy_address,
@@ -368,7 +388,7 @@ class MainWindow(QMainWindow):
         generation = self._config_write_generation
         writer = threading.Thread(
             target=self._write_config_snapshot,
-            args=(generation, gui_settings, gpt_token, file_contents, output_dir, silent),
+            args=(generation, gui_settings, api_tokens, file_contents, output_dir, silent),
             name=f'config-writer-{generation}',
         )
         writer.start()
@@ -378,7 +398,7 @@ class MainWindow(QMainWindow):
         self,
         generation: int,
         gui_settings: dict,
-        gpt_token: str,
+        api_tokens: dict[str, str],
         file_contents: dict[str, str],
         output_dir: str,
         silent: bool,
@@ -399,7 +419,8 @@ class MainWindow(QMainWindow):
                         default_flow_style=False,
                     )
                 os.replace(settings_temp, GUI_SETTINGS_PATH)
-                _save_api_key(gpt_token)
+                for variable_name, api_key in api_tokens.items():
+                    _save_api_key(api_key, variable_name)
                 for path_value, content in file_contents.items():
                     path = Path(path_value)
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -772,22 +793,25 @@ class MainWindow(QMainWindow):
         translation_form.setVerticalSpacing(8)
         translation_form.addWidget(self.adv_translator_label, 0, 0)
         translation_form.addWidget(self.translator_group, 0, 1)
-        translation_form.addWidget(self.adv_concurrency_label, 0, 2)
-        translation_form.addWidget(self.max_concurrent_spin, 0, 3)
+        translation_form.addWidget(self.adv_concurrency_label, 0, 4)
+        translation_form.addWidget(self.max_concurrent_spin, 0, 5)
         translation_form.addWidget(self.adv_online_token_label, 1, 0)
-        translation_form.addWidget(self.gpt_token, 1, 1, 1, 3)
+        translation_form.addWidget(self.gpt_token, 1, 1, 1, 5)
         translation_form.addWidget(self.adv_online_model_label, 2, 0)
-        translation_form.addWidget(self.gpt_model, 2, 1, 1, 3)
-        translation_form.addWidget(self.adv_online_address_label, 3, 0)
-        translation_form.addWidget(self.gpt_address, 3, 1, 1, 3)
-        translation_form.addWidget(self.adv_offline_model_label, 4, 0)
-        translation_form.addWidget(self.sakura_file, 4, 1)
-        translation_form.addWidget(self.adv_offline_gpu_label, 4, 2)
-        translation_form.addWidget(self.sakura_mode, 4, 3)
-        translation_form.addWidget(self.adv_offline_param_label, 5, 0)
-        translation_form.addWidget(self.param_llama, 5, 1, 1, 3)
-        translation_form.setColumnStretch(1, 1)
-        translation_form.setColumnStretch(3, 1)
+        translation_form.addWidget(self.gpt_model, 2, 1, 1, 5)
+        translation_form.addWidget(self.adv_auxiliary_models_label, 3, 0)
+        translation_form.addWidget(self.auxiliary_model_tabs, 3, 1, 1, 5)
+        translation_form.addWidget(self.adv_online_address_label, 4, 0)
+        translation_form.addWidget(self.gpt_address, 4, 1, 1, 3)
+        translation_form.addWidget(self.deepseek_thinking_checkbox, 4, 4, 1, 2)
+        translation_form.addWidget(self.adv_offline_model_label, 5, 0)
+        translation_form.addWidget(self.sakura_file, 5, 1)
+        translation_form.addWidget(self.adv_offline_gpu_label, 5, 2, 1, 2)
+        translation_form.addWidget(self.sakura_mode, 5, 4, 1, 2)
+        translation_form.addWidget(self.adv_offline_param_label, 6, 0)
+        translation_form.addWidget(self.param_llama, 6, 1, 1, 5)
+        for column in (1, 2, 4, 5):
+            translation_form.setColumnStretch(column, 1)
         translation_row.addWidget(translation_panel, 1)
         translation_row.addWidget(self._action_column(
             self.open_model_dir,
@@ -1259,12 +1283,22 @@ class MainWindow(QMainWindow):
         self.shared_progress_bar.setValue(1)
         self.shared_state_label.setText(_("task_state_done"))
 
-    def _start_worker_task(self, operation: str, task_name: str,
-                           show_model_dialog: bool = False):
+    def _start_worker_task(
+        self,
+        operation: str,
+        task_name: str,
+        show_model_dialog: bool = False,
+        snapshot_overrides: dict | None = None,
+        model_target: str | None = None,
+    ):
         if self.thread is not None and self.thread.isRunning():
             self._emit_status(_("status_task_busy"))
             return
         snapshot = self._capture_task_snapshot(operation)
+        if snapshot_overrides:
+            values = dict(snapshot.values)
+            values.update(snapshot_overrides)
+            snapshot = TaskSnapshot(operation=operation, values=values)
         self._set_progress_context(task_name)
         self.thread = QThread()
         self.cancel_token = CancellationToken()
@@ -1273,7 +1307,10 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(getattr(self.worker, operation))
         self.worker.status.connect(self._on_worker_status)
         if show_model_dialog:
-            self.worker.show_model_dialog.connect(self.show_model_selection_dialog)
+            self.worker.show_model_dialog.connect(
+                lambda models, target=model_target:
+                self._handle_model_list_loaded(models, target)
+            )
         self.worker.finished.connect(self._on_task_finished)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1301,6 +1338,31 @@ class MainWindow(QMainWindow):
             'gpt_token': self.gpt_token.text() or _load_api_key(),
             'gpt_address': self.gpt_address.text(),
             'gpt_model': self.gpt_model.text(),
+            'ai_resegment_model': self._auxiliary_model_value(
+                self.ai_resegment_model_combo
+            ),
+            'ai_resegment_provider': (
+                self.ai_resegment_provider_combo.currentData() or 'follow'
+            ),
+            'ai_resegment_address': self.ai_resegment_address.text().strip(),
+            'ai_resegment_token': (
+                self.ai_resegment_token.text()
+                or _load_api_key('VOICETRANSL_RESEGMENT_API_KEY')
+            ),
+            'proofread_model': self._auxiliary_model_value(
+                self.proofread_model_combo
+            ),
+            'proofread_provider': (
+                self.proofread_provider_combo.currentData() or 'follow'
+            ),
+            'proofread_address': self.proofread_address.text().strip(),
+            'proofread_token': (
+                self.proofread_token.text()
+                or _load_api_key('VOICETRANSL_PROOFREAD_API_KEY')
+            ),
+            'deepseek_thinking': self.deepseek_thinking_checkbox.isChecked(),
+            'ai_resegment_thinking': self.ai_resegment_thinking_checkbox.isChecked(),
+            'proofread_thinking': self.proofread_thinking_checkbox.isChecked(),
             'sakura_file': self.sakura_file.currentText(),
             'sakura_mode': self.sakura_mode.text(),
             'proxy_address': self.proxy_address.text(),
@@ -1657,6 +1719,157 @@ class MainWindow(QMainWindow):
             if current_model in sakura_lst:
                 self.sakura_file.setCurrentText(current_model)
 
+    @staticmethod
+    def _auxiliary_model_value(combo: QComboBox) -> str:
+        if combo.isEditable():
+            return combo.currentText().strip()
+        data = combo.currentData()
+        if isinstance(data, str):
+            return data.strip()
+        return combo.currentText().strip()
+
+    def _set_auxiliary_model_value(self, combo: QComboBox, model_name: str):
+        value = (model_name or '').strip()
+        index = combo.findData(value)
+        combo.blockSignals(True)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setCurrentIndex(-1)
+            combo.setEditText(value)
+        combo.blockSignals(False)
+
+    def _update_auxiliary_profile_controls(
+        self,
+        provider_combo: QComboBox,
+        model_combo: QComboBox,
+        token_edit: QLineEdit,
+        address_edit: QLineEdit,
+        thinking_checkbox: QCheckBox | None = None,
+    ):
+        provider = provider_combo.currentData() or 'follow'
+        self._refresh_auxiliary_model_choices(provider_combo, model_combo)
+        independent = provider != 'follow'
+        for widget in (model_combo, token_edit, address_edit):
+            widget.setEnabled(independent)
+        if independent:
+            endpoint = ONLINE_TRANSLATOR_MAPPING.get(provider, '')
+            address_edit.setPlaceholderText(
+                endpoint or _("aux_profile_custom_address_placeholder")
+            )
+        if thinking_checkbox is not None:
+            if provider == 'follow':
+                model_name = self.gpt_model.text()
+            else:
+                model_name = model_combo.currentText()
+            thinking_checkbox.setEnabled(model_supports_thinking(model_name))
+            if not thinking_checkbox.isEnabled():
+                thinking_checkbox.setChecked(False)
+        self._update_thinking_availability()
+
+    def _refresh_auxiliary_model_choices(
+        self, provider_combo: QComboBox, model_combo: QComboBox
+    ):
+        """Keep discovered/preset models scoped to the selected provider."""
+        provider = provider_combo.currentData() or 'follow'
+        previous_provider = getattr(model_combo, '_auxiliary_provider', None)
+        cache_key = id(model_combo)
+        cache = self._auxiliary_model_cache.setdefault(cache_key, {})
+        previous_text = model_combo.currentText().strip()
+        if previous_provider and previous_text:
+            cache[previous_provider] = previous_text
+
+        if provider == 'Deepseek':
+            choices = ['deepseek-v4-flash', 'deepseek-v4-pro']
+        else:
+            choices = []
+        choices.extend(
+            self._auxiliary_discovered_models_for_provider(
+                model_combo, provider
+            )
+        )
+        saved_value = cache.get(provider, '')
+        model_combo.blockSignals(True)
+        model_combo.clear()
+        model_combo.setEditable(True)
+        for value in dict.fromkeys(choices):
+            model_combo.addItem(value, userData=value)
+        if saved_value:
+            model_combo.setEditText(saved_value)
+        elif provider == 'Deepseek':
+            model_combo.setCurrentText('deepseek-v4-flash')
+        else:
+            model_combo.setEditText('')
+        model_combo.blockSignals(False)
+        model_combo._auxiliary_provider = provider
+
+    def _auxiliary_discovered_models_for_provider(
+        self, model_combo: QComboBox, provider: str
+    ) -> list[str]:
+        by_provider = getattr(self, '_discovered_models_by_provider', {})
+        return list(by_provider.get((id(model_combo), provider), []))
+
+    def _update_thinking_availability(self):
+        if not hasattr(self, 'deepseek_thinking_checkbox'):
+            return
+        main_supported = model_supports_thinking(self.gpt_model.text())
+        self.deepseek_thinking_checkbox.setEnabled(main_supported)
+        if not main_supported:
+            self.deepseek_thinking_checkbox.setChecked(False)
+        for provider_combo, model_combo, checkbox in (
+            (
+                getattr(self, 'ai_resegment_provider_combo', None),
+                getattr(self, 'ai_resegment_model_combo', None),
+                getattr(self, 'ai_resegment_thinking_checkbox', None),
+            ),
+            (
+                getattr(self, 'proofread_provider_combo', None),
+                getattr(self, 'proofread_model_combo', None),
+                getattr(self, 'proofread_thinking_checkbox', None),
+            ),
+        ):
+            if provider_combo is None or model_combo is None or checkbox is None:
+                continue
+            provider = provider_combo.currentData() or 'follow'
+            model_name = (
+                self.gpt_model.text() if provider == 'follow'
+                else model_combo.currentText()
+            )
+            checkbox.setEnabled(model_supports_thinking(model_name))
+            if not checkbox.isEnabled():
+                checkbox.setChecked(False)
+
+    @staticmethod
+    def _set_provider_value(combo: QComboBox, provider: str):
+        index = combo.findData(provider or 'follow')
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _add_discovered_auxiliary_models(self, models, target=None):
+        incoming = {
+            str(model).strip() for model in models if str(model).strip()
+        }
+        if target in ('resegment', 'proofread'):
+            if target == 'resegment':
+                provider_combo = self.ai_resegment_provider_combo
+                model_combo = self.ai_resegment_model_combo
+            else:
+                provider_combo = self.proofread_provider_combo
+                model_combo = self.proofread_model_combo
+            provider = provider_combo.currentData() or 'follow'
+            if provider != 'follow':
+                by_provider = getattr(self, '_discovered_models_by_provider', {})
+                key = (id(model_combo), provider)
+                by_provider.setdefault(key, [])
+                for model_name in incoming:
+                    if model_name not in by_provider[key]:
+                        by_provider[key].append(model_name)
+                self._discovered_models_by_provider = by_provider
+                self._refresh_auxiliary_model_choices(provider_combo, model_combo)
+        discovered = set(getattr(self, '_discovered_online_models', []))
+        discovered.update(incoming)
+        self._discovered_online_models = sorted(discovered)
+
     def cancel_task(self):
         if self.cancel_token and self.thread and self.thread.isRunning():
             self._emit_status(_("status_cancelling"))
@@ -1765,6 +1978,61 @@ class MainWindow(QMainWindow):
                 self.transcription_lang.setCurrentIndex(language_index)
             self.gpt_address.setText(gui_settings.get('gpt_address', ''))
             self.gpt_model.setText(gui_settings.get('gpt_model', ''))
+            self._set_provider_value(
+                self.ai_resegment_provider_combo,
+                gui_settings.get('ai_resegment_provider', 'follow'),
+            )
+            self.ai_resegment_address.setText(
+                gui_settings.get('ai_resegment_address', '')
+            )
+            self.ai_resegment_token.setText(
+                _load_api_key('VOICETRANSL_RESEGMENT_API_KEY')
+            )
+            self._update_auxiliary_profile_controls(
+                self.ai_resegment_provider_combo,
+                self.ai_resegment_model_combo,
+                self.ai_resegment_token,
+                self.ai_resegment_address,
+            )
+            self._set_auxiliary_model_value(
+                self.ai_resegment_model_combo,
+                gui_settings.get('ai_resegment_model', ''),
+            )
+            self._set_provider_value(
+                self.proofread_provider_combo,
+                gui_settings.get('proofread_provider', 'follow'),
+            )
+            self.proofread_address.setText(
+                gui_settings.get('proofread_address', '')
+            )
+            self.proofread_token.setText(
+                _load_api_key('VOICETRANSL_PROOFREAD_API_KEY')
+            )
+            self._update_auxiliary_profile_controls(
+                self.proofread_provider_combo,
+                self.proofread_model_combo,
+                self.proofread_token,
+                self.proofread_address,
+            )
+            self._set_auxiliary_model_value(
+                self.proofread_model_combo,
+                gui_settings.get('proofread_model', ''),
+            )
+            self.deepseek_thinking_checkbox.setChecked(
+                gui_settings.get('deepseek_thinking', False)
+            )
+            self.ai_resegment_thinking_checkbox.setChecked(
+                gui_settings.get(
+                    'ai_resegment_thinking',
+                    gui_settings.get('deepseek_thinking', False),
+                )
+            )
+            self.proofread_thinking_checkbox.setChecked(
+                gui_settings.get(
+                    'proofread_thinking',
+                    gui_settings.get('deepseek_thinking', False),
+                )
+            )
             if self.sakura_file:
                 self.sakura_file.setCurrentText(gui_settings.get('sakura_file', ''))
             self.sakura_mode.setText(gui_settings.get('sakura_mode', ''))
@@ -1831,6 +2099,13 @@ class MainWindow(QMainWindow):
         api_key = _load_api_key()
         if api_key:
             self.gpt_token.setText(api_key)
+        if not gui_settings:
+            self.ai_resegment_token.setText(
+                _load_api_key('VOICETRANSL_RESEGMENT_API_KEY')
+            )
+            self.proofread_token.setText(
+                _load_api_key('VOICETRANSL_PROOFREAD_API_KEY')
+            )
 
         if not self.output_dir_edit.text().strip():
             self.output_dir_edit.setText(self.default_output_dir())
@@ -2475,6 +2750,118 @@ class MainWindow(QMainWindow):
         self.gpt_model.setPlaceholderText(_("adv_online_model_placeholder"))
         self.advanced_settings_layout.addWidget(self.gpt_model)
 
+        self._discovered_online_models = []
+        self._auxiliary_model_cache = {}
+
+        def make_auxiliary_profile():
+            panel = QWidget()
+            grid = QGridLayout(panel)
+            grid.setContentsMargins(6, 6, 6, 6)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(6)
+
+            provider_combo = QComboBox()
+            provider_combo.addItem(_("aux_profile_follow_main"), userData='follow')
+            provider_combo.addItem(_("aux_profile_custom"), userData='custom')
+            for provider in ONLINE_TRANSLATOR_MAPPING:
+                provider_combo.addItem(provider, userData=provider)
+            model_combo = QComboBox()
+            model_combo.setEditable(True)
+            model_combo.addItem('deepseek-v4-flash', userData='deepseek-v4-flash')
+            model_combo.addItem('deepseek-v4-pro', userData='deepseek-v4-pro')
+            model_combo._provider_combo = provider_combo
+            token_edit = QLineEdit()
+            token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            token_edit.setPlaceholderText(_("aux_profile_token_placeholder"))
+            address_edit = QLineEdit()
+            thinking_checkbox = QCheckBox(_("aux_profile_thinking"))
+            thinking_checkbox.setToolTip(_("tip_aux_profile_thinking"))
+            test_button = QPushButton(_("aux_profile_test_btn"))
+
+            grid.addWidget(BodyLabel(_("aux_profile_provider_label")), 0, 0)
+            grid.addWidget(provider_combo, 0, 1)
+            grid.addWidget(BodyLabel(_("aux_profile_model_label")), 0, 2)
+            grid.addWidget(model_combo, 0, 3)
+            grid.addWidget(BodyLabel(_("aux_profile_token_label")), 1, 0)
+            grid.addWidget(token_edit, 1, 1)
+            grid.addWidget(BodyLabel(_("aux_profile_address_label")), 1, 2)
+            grid.addWidget(address_edit, 1, 3)
+            grid.addWidget(thinking_checkbox, 2, 0, 1, 2)
+            grid.addWidget(test_button, 2, 2, 1, 2)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
+
+            provider_combo.currentIndexChanged.connect(
+                lambda _index, provider=provider_combo, model=model_combo,
+                token=token_edit, address=address_edit,
+                thinking=thinking_checkbox:
+                    self._update_auxiliary_profile_controls(
+                        provider, model, token, address, thinking
+                    )
+            )
+            model_combo.editTextChanged.connect(
+                lambda _text, combo=model_combo:
+                self._update_thinking_availability()
+            )
+            self._update_auxiliary_profile_controls(
+                provider_combo, model_combo, token_edit, address_edit,
+                thinking_checkbox,
+            )
+            return (
+                panel,
+                provider_combo,
+                model_combo,
+                token_edit,
+                address_edit,
+                thinking_checkbox,
+                test_button,
+            )
+
+        self.adv_auxiliary_models_label = BodyLabel(_("adv_auxiliary_models_label"))
+        self.adv_auxiliary_models_label.setToolTip(_("tip_auxiliary_profiles"))
+        self.auxiliary_model_tabs = QTabWidget()
+        (
+            resegment_panel,
+            self.ai_resegment_provider_combo,
+            self.ai_resegment_model_combo,
+            self.ai_resegment_token,
+            self.ai_resegment_address,
+            self.ai_resegment_thinking_checkbox,
+            self.ai_resegment_test_button,
+        ) = make_auxiliary_profile()
+        (
+            proofread_panel,
+            self.proofread_provider_combo,
+            self.proofread_model_combo,
+            self.proofread_token,
+            self.proofread_address,
+            self.proofread_thinking_checkbox,
+            self.proofread_test_button,
+        ) = make_auxiliary_profile()
+        self.ai_resegment_test_button.clicked.connect(
+            lambda: self.run_test_auxiliary_api('ai_resegment')
+        )
+        self.proofread_test_button.clicked.connect(
+            lambda: self.run_test_auxiliary_api('proofread')
+        )
+        self.auxiliary_model_tabs.addTab(
+            resegment_panel, _("adv_ai_resegment_model_label")
+        )
+        self.auxiliary_model_tabs.addTab(
+            proofread_panel, _("adv_proofread_model_label")
+        )
+        self.advanced_settings_layout.addWidget(self.adv_auxiliary_models_label)
+        self.advanced_settings_layout.addWidget(self.auxiliary_model_tabs)
+
+        self.deepseek_thinking_checkbox = QCheckBox(_("adv_deepseek_thinking"))
+        self.deepseek_thinking_checkbox.setChecked(False)
+        self.deepseek_thinking_checkbox.setToolTip(_("tip_deepseek_thinking"))
+        self.gpt_model.textChanged.connect(lambda _text: self._update_thinking_availability())
+        self.translator_group.currentIndexChanged.connect(
+            lambda _index: self._update_thinking_availability()
+        )
+        self.advanced_settings_layout.addWidget(self.deepseek_thinking_checkbox)
+
         self.adv_online_address_label = BodyLabel(_("adv_online_address_label"))
         self.advanced_settings_layout.addWidget(self.adv_online_address_label)
         self.gpt_address = QLineEdit()
@@ -2706,8 +3093,29 @@ class MainWindow(QMainWindow):
     def run_summarize(self):
         self._start_worker_task('summarize', _("task_summarize"))
 
-    def show_model_selection_dialog(self, models):
+    def _handle_model_list_loaded(self, models, fixed_target=None):
+        """Apply auxiliary lists directly; only the main profile needs a chooser."""
+        if fixed_target:
+            self._add_discovered_auxiliary_models(models, fixed_target)
+            if fixed_target == 'resegment':
+                model_combo = self.ai_resegment_model_combo
+            else:
+                model_combo = self.proofread_model_combo
+            model_combo.setFocus()
+            self._emit_status(
+                _("status_aux_models_loaded", count=len(models))
+            )
+            return
+        self.show_model_selection_dialog(models)
+
+    def show_model_selection_dialog(self, models, fixed_target=None):
+        self._add_discovered_auxiliary_models(models, fixed_target)
+        previous_dialog = getattr(self, '_model_selection_dialog', None)
+        if previous_dialog is not None:
+            previous_dialog.close()
         dialog = QDialog(self)
+        self._model_selection_dialog = dialog
+        dialog.setModal(False)
         dialog.setWindowTitle(_("dialog_select_model_title"))
         dialog.setMinimumWidth(400)
         layout = QVBoxLayout(dialog)
@@ -2719,6 +3127,19 @@ class MainWindow(QMainWindow):
         combo.addItems(models)
         layout.addWidget(combo)
 
+        target_label = QLabel(_("dialog_model_target_label"))
+        layout.addWidget(target_label)
+        target_combo = QComboBox()
+        target_combo.addItem(_("dialog_model_target_translation"), userData='translation')
+        target_combo.addItem(_("dialog_model_target_resegment"), userData='resegment')
+        target_combo.addItem(_("dialog_model_target_proofread"), userData='proofread')
+        if fixed_target:
+            fixed_index = target_combo.findData(fixed_target)
+            if fixed_index >= 0:
+                target_combo.setCurrentIndex(fixed_index)
+                target_combo.setEnabled(False)
+        layout.addWidget(target_combo)
+
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton(_("dialog_ok"))
         cancel_btn = QPushButton(_("dialog_cancel"))
@@ -2726,18 +3147,66 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
-        ok_btn.clicked.connect(lambda: (
-            self.gpt_model.setText(combo.currentText()),
+        def apply_selected_model():
+            model_name = combo.currentText()
+            target = target_combo.currentData()
+            if target == 'resegment':
+                self._set_auxiliary_model_value(
+                    self.ai_resegment_model_combo, model_name
+                )
+            elif target == 'proofread':
+                self._set_auxiliary_model_value(
+                    self.proofread_model_combo, model_name
+                )
+            else:
+                self.gpt_model.setText(model_name)
+            self._schedule_auto_save()
             dialog.accept()
-        ))
-        cancel_btn.clicked.connect(dialog.reject)
 
-        dialog.exec()
+        ok_btn.clicked.connect(apply_selected_model)
+        cancel_btn.clicked.connect(dialog.reject)
+        dialog.finished.connect(
+            lambda _result: setattr(self, '_model_selection_dialog', None)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def run_test_online_api(self):
         self._start_worker_task(
             'test_online_api', _("task_api_test"),
             show_model_dialog=True,
+        )
+
+    def run_test_auxiliary_api(self, prefix: str):
+        if prefix == 'ai_resegment':
+            provider_combo = self.ai_resegment_provider_combo
+            model_combo = self.ai_resegment_model_combo
+            token_edit = self.ai_resegment_token
+            address_edit = self.ai_resegment_address
+            target = 'resegment'
+        else:
+            provider_combo = self.proofread_provider_combo
+            model_combo = self.proofread_model_combo
+            token_edit = self.proofread_token
+            address_edit = self.proofread_address
+            target = 'proofread'
+
+        provider = provider_combo.currentData() or 'follow'
+        overrides = {}
+        if provider != 'follow':
+            overrides = {
+                'translator': provider,
+                'gpt_model': self._auxiliary_model_value(model_combo),
+                'gpt_token': token_edit.text() or self.gpt_token.text(),
+                'gpt_address': address_edit.text().strip(),
+            }
+        self._start_worker_task(
+            'test_online_api',
+            _("task_api_test"),
+            show_model_dialog=True,
+            snapshot_overrides=overrides,
+            model_target=target,
         )
     
     def cleaner(self):

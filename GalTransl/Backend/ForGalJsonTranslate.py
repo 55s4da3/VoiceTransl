@@ -38,8 +38,16 @@ class ForGalJsonTranslate(BaseTranslate):
         """官方 DeepSeek V4 全量校对显式请求模型支持的最大输出。"""
         if not proofread:
             return NOT_GIVEN
-        for _client, token in getattr(self, "client_list", []):
-            model_name = str(getattr(token, "model_name", "") or "").lower()
+        client_list = (
+            getattr(self, "proofread_client_list", [])
+            or getattr(self, "client_list", [])
+        )
+        for _client, token in client_list:
+            model_name = str(
+                self.proofread_model_name
+                or getattr(token, "model_name", "")
+                or ""
+            ).lower()
             domain = str(getattr(token, "domain", "") or "").lower()
             if model_name.startswith("deepseek-v4") and "api.deepseek.com" in domain:
                 return self._DEEPSEEK_V4_MAX_OUTPUT_TOKENS
@@ -205,6 +213,10 @@ class ForGalJsonTranslate(BaseTranslate):
                 base_try_count=retry_count,
                 stream_line_callback=_parse_stream_lines,
                 max_tokens=self._get_proofread_max_tokens(proofread),
+                model_override=(
+                    self.proofread_model_name if proofread else NOT_GIVEN
+                ),
+                use_proofread_profile=proofread,
             )
 
             result_text = resp or ""
@@ -245,7 +257,7 @@ class ForGalJsonTranslate(BaseTranslate):
                     parse_ok, parse_error = self._parse_jsonline_result_line(
                         line,
                         trans_list,
-                        getattr(token, "model_name", ""),
+                        getattr(self, "_last_chatbot_model_name", ""),
                         n_symbol,
                         key_name,
                         {"i": i, "success_count": success_count},
@@ -291,7 +303,7 @@ class ForGalJsonTranslate(BaseTranslate):
                         filename=filename,
                         index_range=str(idx_tip),
                         retry_count=retry_count + 1,
-                        model=getattr(token, "model_name", ""),
+                        model=getattr(self, "_last_chatbot_model_name", ""),
                         level="warning",
                     )
                 except Exception:
@@ -348,7 +360,7 @@ class ForGalJsonTranslate(BaseTranslate):
                         trans_list,
                         0 if i < 0 else i,
                         result_trans_list,
-                        getattr(token, "model_name", ""),
+                        getattr(self, "_last_chatbot_model_name", ""),
                         proofread=proofread,
                         translate_failed_prefix="(Failed)",
                         translate_problem_message="翻译失败",

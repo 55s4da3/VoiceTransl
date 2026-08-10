@@ -14,7 +14,12 @@ from PySide6.QtCore import QObject, Signal
 
 import asrlabs_bridge
 import crispasr_bridge
-from core import _SEPARATE_CMD, _load_api_key, ONLINE_TRANSLATOR_MAPPING
+from core import (
+    _SEPARATE_CMD,
+    _load_api_key,
+    ONLINE_TRANSLATOR_MAPPING,
+    model_supports_thinking,
+)
 from i18n import _
 from log import _stream_proc_to_queue
 from pool import ConcurrentTranslationPool, TranscribedFile
@@ -152,31 +157,67 @@ class MainWorker(QObject):
                 target_file.write(chunk)
         self._raise_if_cancelled()
 
+    def _resolve_online_profile(self, prefix: str) -> dict:
+        """Resolve an auxiliary online profile from the immutable snapshot."""
+        main_provider = self.config.get('translator', '')
+        main_endpoint = (
+            self.config.get('gpt_address', '')
+            if 'custom' in main_provider.lower()
+            else ONLINE_TRANSLATOR_MAPPING.get(main_provider, '')
+        )
+        main_token = self.config.get('gpt_token', '') or _load_api_key()
+        main_model = self.config.get('gpt_model', '')
+
+        provider = self.config.get(f'{prefix}_provider', 'follow') or 'follow'
+        if provider == 'follow':
+            return {
+                'provider': main_provider,
+                'endpoint': main_endpoint,
+                'model': main_model,
+                'token': main_token,
+                'follows_main': True,
+            }
+
+        endpoint = (
+            self.config.get(f'{prefix}_address', '')
+            if provider == 'custom'
+            else ONLINE_TRANSLATOR_MAPPING.get(provider, '')
+        )
+        return {
+            'provider': provider,
+            'endpoint': endpoint,
+            'model': self.config.get(f'{prefix}_model', '') or main_model,
+            'token': self.config.get(f'{prefix}_token', '') or main_token,
+            'follows_main': False,
+        }
+
     def _maybe_refine_json(self, json_path: str) -> list[dict]:
         with open(json_path, 'r', encoding='utf-8') as stream:
             rows = json.load(stream)
         if not self.config.get('enable_ai_resegment', False) or not rows:
             return rows
 
-        translator = self.config.get('translator', '')
-        if 'sakura' in translator.lower() or 'llamacpp' in translator.lower():
+        profile = self._resolve_online_profile('ai_resegment')
+        provider = str(profile['provider'])
+        if (
+            profile['follows_main']
+            and ('sakura' in provider.lower() or 'llamacpp' in provider.lower())
+        ):
             self._emit_status(_("status_ai_resegment_unsupported"))
             return rows
-        endpoint = (
-            self.config.get('gpt_address', '')
-            if 'custom' in translator.lower()
-            else ONLINE_TRANSLATOR_MAPPING.get(translator, '')
-        )
         self._emit_status(_("status_ai_resegment_start", count=len(rows)))
 
         def requester(prompt: str) -> str:
             return request_openai_compatible(
                 prompt,
-                endpoint=endpoint,
-                model=self.config.get('gpt_model', ''),
-                api_key=self.config.get('gpt_token', '') or _load_api_key(),
+                endpoint=profile['endpoint'],
+                model=profile['model'],
+                api_key=profile['token'],
                 proxy=self.config.get('proxy_address', ''),
                 cancel_token=self.cancel_token,
+                thinking_enabled=bool(
+                    self.config.get('ai_resegment_thinking', False)
+                ),
             )
 
         refiner = SentenceRefiner(
@@ -245,6 +286,8 @@ class MainWorker(QObject):
         gpt_token = self.config.get('gpt_token', '') or _load_api_key()
         gpt_address = self.config.get('gpt_address', '')
         gpt_model = self.config.get('gpt_model', '')
+        proofread_profile = self._resolve_online_profile('proofread')
+        proofread_model = proofread_profile['model'] or gpt_model
         sakura_file = self.config.get('sakura_file', '')
         proxy_address = self.config.get('proxy_address', '')
 
@@ -317,17 +360,36 @@ class MainWorker(QObject):
                 'endpoint': endpoint,
                 'modelName': model
             }]
+            openai_cfg['proofreadModelName'] = proofread_model
+            openai_cfg['proofreadEndpoint'] = (
+                '' if proofread_profile['follows_main']
+                else proofread_profile['endpoint']
+            )
+            openai_cfg['proofreadToken'] = (
+                '' if proofread_profile['follows_main']
+                else proofread_profile['token']
+            )
             openai_cfg['tokenStrategy'] = "random"
             openai_cfg['checkAvailable'] = True
             openai_cfg['stream'] = True
             openai_cfg['apiTimeout'] = 120
             openai_cfg['apiErrorWait'] = "auto"
-            # DeepSeek V4 默认思考会显著拖慢批量字幕翻译并消耗大量 token。
-            # 对其他兼容接口沿用服务端默认，避免发送不支持的扩展字段。
-            if 'api.deepseek.com' in endpoint.lower() and model.lower().startswith('deepseek-v4'):
-                openai_cfg['thinkingMode'] = 'disabled'
+            if model_supports_thinking(model):
+                openai_cfg['thinkingMode'] = (
+                    'enabled'
+                    if self.config.get('deepseek_thinking', False)
+                    else 'disabled'
+                )
             else:
                 openai_cfg['thinkingMode'] = 'auto'
+            if model_supports_thinking(proofread_model):
+                openai_cfg['proofreadThinkingMode'] = (
+                    'enabled'
+                    if self.config.get('proofread_thinking', False)
+                    else 'disabled'
+                )
+            else:
+                openai_cfg['proofreadThinkingMode'] = 'auto'
 
         # Update proxy configuration
         if 'proxy' not in cfg:
@@ -386,7 +448,13 @@ class MainWorker(QObject):
             self._emit_status(_("status_api_select_model"))
             return
 
-        base_url = base_url.rstrip('/') + '/v1/models'
+        base_url = re.sub(
+            r'/chat/completions$', '', base_url.rstrip('/'), flags=re.IGNORECASE
+        )
+        if re.search(r'/v\d+(?:beta)?(?:/openai)?$', base_url):
+            base_url += '/models'
+        else:
+            base_url += '/v1/models'
 
         self._emit_status(_("status_api_testing", url=base_url))
         try:
@@ -412,14 +480,27 @@ class MainWorker(QObject):
             self._raise_if_cancelled()
 
             models = []
+            seen_models = set()
             parse_error = False
             try:
                 data = resp.json()
                 if isinstance(data, dict) and 'data' in data:
                     for item in data['data']:
                         if isinstance(item, dict) and 'id' in item:
-                            models.append(item['id'])
+                            model_id = str(item['id']).strip()
+                            if model_id and model_id not in seen_models:
+                                seen_models.add(model_id)
+                                models.append(model_id)
                 if models:
+                    total_models = len(models)
+                    model_limit = 500
+                    if total_models > model_limit:
+                        models = models[:model_limit]
+                        self._emit_status(_(
+                            "status_api_models_truncated",
+                            total=total_models,
+                            limit=model_limit,
+                        ))
                     self.show_model_dialog.emit(models)
                     self._emit_status(_("status_api_complete", count=len(models)))
                 else:

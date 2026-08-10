@@ -1,5 +1,6 @@
 import sys, os
 import subprocess
+import re
 
 _FROZEN = hasattr(sys, '_MEIPASS')
 os.chdir(sys._MEIPASS) if _FROZEN else os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +79,19 @@ ONLINE_TRANSLATOR_MAPPING = {
     "llamacpp（通用本地模型）": "http://localhost:8989",
 }
 
+
+def model_supports_thinking(model_name: str) -> bool:
+    """Best-effort capability check for models exposing reasoning/thinking."""
+    name = str(model_name or '').strip().lower()
+    if not name:
+        return False
+    if any(marker in name for marker in (
+        'deepseek-v4', 'deepseek-reasoner', 'reasoning', 'thinking',
+        'qwq', 'qwen3',
+    )):
+        return True
+    return bool(re.search(r'(^|[-_/:.])(?:r1|o1|o3|o4)(?:[-_/:.]|$)', name))
+
 TRANSLATOR_SUPPORTED = [
     "custom（自定义模型）",
     "sakura（日语本地模型）",
@@ -85,18 +99,21 @@ TRANSLATOR_SUPPORTED = [
 
 
 # .env API Key 读写辅助函数
-def _load_api_key() -> str:
+def _load_api_key(variable_name: str = 'VOICETRANSL_API_KEY') -> str:
     """从项目根目录 .env 文件中读取 API Key"""
     if not os.path.exists('.env'):
         return ''
     with open('.env', 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
-            if line.startswith('VOICETRANSL_API_KEY='):
+            if line.startswith(variable_name + '='):
                 return line.split('=', 1)[1].strip()
 
 
-def _save_api_key(api_key: str) -> None:
+def _save_api_key(
+    api_key: str,
+    variable_name: str = 'VOICETRANSL_API_KEY',
+) -> None:
     """将 API Key 写入项目根目录 .env 文件"""
     lines = []
     if os.path.exists('.env'):
@@ -105,13 +122,13 @@ def _save_api_key(api_key: str) -> None:
     found = False
     with open('.env', 'w', encoding='utf-8') as f:
         for line in lines:
-            if line.startswith('VOICETRANSL_API_KEY='):
-                f.write(f'VOICETRANSL_API_KEY={api_key}\n')
+            if line.startswith(variable_name + '='):
+                f.write(f'{variable_name}={api_key}\n')
                 found = True
             else:
                 f.write(line)
         if not found:
-            f.write(f'VOICETRANSL_API_KEY={api_key}\n')
+            f.write(f'{variable_name}={api_key}\n')
 
 
 # redirect sys.stdout and sys.stderr to one log file

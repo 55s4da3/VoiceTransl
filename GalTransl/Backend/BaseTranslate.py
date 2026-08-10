@@ -19,6 +19,7 @@ from openai import RateLimitError, AsyncOpenAI
 from openai import DefaultAioHttpClient
 from openai._types import NOT_GIVEN
 import random
+import re
 import time
 from contextlib import suppress
 from GalTransl.TerminalOutput import should_print_translation_logs
@@ -195,6 +196,32 @@ class BaseTranslate:
             )
             thinking_mode = "auto"
         self.thinking_mode = thinking_mode
+        self.proofread_model_name = str(
+            config.getBackendConfigSection(section_name).get(
+                "proofreadModelName", ""
+            )
+            or ""
+        ).strip()
+        proofread_endpoint = str(
+            config.getBackendConfigSection(section_name).get(
+                "proofreadEndpoint", ""
+            )
+            or ""
+        ).strip()
+        proofread_token = str(
+            config.getBackendConfigSection(section_name).get(
+                "proofreadToken", ""
+            )
+            or ""
+        ).strip()
+        proofread_thinking_mode = str(
+            config.getBackendConfigSection(section_name).get(
+                "proofreadThinkingMode", "auto"
+            )
+        ).strip().lower()
+        if proofread_thinking_mode not in {"auto", "enabled", "disabled"}:
+            proofread_thinking_mode = "auto"
+        self.proofread_thinking_mode = proofread_thinking_mode
 
         change_prompt = CProjectConfig.getProjectConfig(config)["common"].get(
             "gpt.change_prompt", "no"
@@ -253,6 +280,35 @@ class BaseTranslate:
                 ),
             )
             self.client_list.append((client, token))
+
+        self.proofread_client_list = []
+        if proofread_endpoint and proofread_token and self.proofread_model_name:
+            domain = proofread_endpoint.rstrip("/")
+            domain = re.sub(r"/chat/completions$", "", domain)
+            if not re.search(r"/v\d+(?:beta)?(?:/openai)?$", domain):
+                domain += "/v1"
+            proofread_api_token = COpenAIToken(
+                proofread_token,
+                domain=domain,
+                model_name=self.proofread_model_name,
+                stream=self.stream,
+                isAvailable=True,
+            )
+            proofread_client = AsyncOpenAI(
+                api_key=proofread_api_token.token,
+                base_url=proofread_api_token.domain,
+                max_retries=0,
+                http_client=DefaultAioHttpClient(
+                    trust_env=trust_env,
+                    limits=httpx.Limits(
+                        max_keepalive_connections=None, max_connections=None
+                    ),
+                    **proxy_kwargs,
+                ),
+            )
+            self.proofread_client_list.append(
+                (proofread_client, proofread_api_token)
+            )
 
         pass
 
@@ -590,6 +646,13 @@ class BaseTranslate:
         except Exception:
             return
 
+    @staticmethod
+    def _request_model_name(token: COpenAIToken, model_override=NOT_GIVEN) -> str:
+        if model_override is NOT_GIVEN or model_override is None:
+            return token.model_name
+        value = str(model_override).strip()
+        return value or token.model_name
+
     async def ask_chatbot(
         self,
         prompt="",
@@ -604,18 +667,30 @@ class BaseTranslate:
         file_name="",
         base_try_count=0,
         stream_line_callback=None,
+        model_override=NOT_GIVEN,
+        use_proofread_profile=False,
     ):
         api_try_count = base_try_count
         client: AsyncOpenAI
         token: COpenAIToken
-        client, token = random.choices(self.client_list, k=1)[0]
+        active_client_list = (
+            self.proofread_client_list
+            if use_proofread_profile and self.proofread_client_list
+            else self.client_list
+        )
+        active_thinking_mode = (
+            self.proofread_thinking_mode
+            if use_proofread_profile and self.proofread_client_list
+            else self.thinking_mode
+        )
+        client, token = random.choices(active_client_list, k=1)[0]
         if messages is None:
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
 
-        if "gemini" in token.model_name:
+        if "gemini" in self._request_model_name(token, model_override):
             temperature = NOT_GIVEN
 
         while True:
@@ -630,15 +705,16 @@ class BaseTranslate:
             try:
                 if self.tokenStrategy == "random":
                     if api_try_count % 2 == 0:
-                        client, token = random.choices(self.client_list, k=1)[0]
+                        client, token = random.choices(active_client_list, k=1)[0]
                 elif self.tokenStrategy == "fallback":
-                    index = api_try_count % len(self.client_list)
-                    client, token = self.client_list[index]
+                    index = api_try_count % len(active_client_list)
+                    client, token = active_client_list[index]
                 else:
                     raise ValueError("tokenStrategy must be random or fallback")
                 is_stream=stream if stream != NOT_GIVEN else token.stream
                 self._last_chatbot_was_stream = bool(is_stream)
-                self._last_chatbot_model_name = getattr(token, "model_name", "")
+                request_model = self._request_model_name(token, model_override)
+                self._last_chatbot_model_name = request_model
                 self._last_chatbot_finish_reason = None
                 LOGGER.debug(f"Call {token.domain} withs token {token.maskToken()}")
 
@@ -647,7 +723,7 @@ class BaseTranslate:
                 # Create the API call as a task so we can cancel it if
                 # the user requests a stop while the request is in-flight.
                 request_kwargs = dict(
-                    model=token.model_name,
+                    model=request_model,
                     messages=messages,
                     stream=is_stream,
                     temperature=temperature,
@@ -660,10 +736,25 @@ class BaseTranslate:
                 # DeepSeek V4 默认可能开启思考，翻译任务会因此消耗大量隐藏
                 # reasoning token。仅在配置明确指定时发送兼容参数，避免影响
                 # 不支持 thinking 字段的其他 OpenAI 兼容服务。
-                if self.thinking_mode != "auto":
-                    request_kwargs["extra_body"] = {
-                        "thinking": {"type": self.thinking_mode}
-                    }
+                if active_thinking_mode != "auto":
+                    model_lower = request_model.lower()
+                    if model_lower.startswith("deepseek-v4"):
+                        request_kwargs["extra_body"] = {
+                            "thinking": {"type": active_thinking_mode}
+                        }
+                    elif "qwen3" in model_lower or "qwq" in model_lower:
+                        request_kwargs["extra_body"] = {
+                            "enable_thinking": active_thinking_mode == "enabled"
+                        }
+                    elif re.search(
+                        r"(^|[-_/:.])(?:r1|o1|o3|o4)(?:[-_/:.]|$)|reason",
+                        model_lower,
+                    ):
+                        # OpenAI reasoning models expose a standard effort field;
+                        # low effort is the closest supported disabled setting.
+                        request_kwargs["reasoning_effort"] = (
+                            "high" if active_thinking_mode == "enabled" else "low"
+                        )
 
                 api_task = asyncio.ensure_future(
                     client.chat.completions.create(**request_kwargs)
@@ -784,7 +875,7 @@ class BaseTranslate:
                     sleep_time = 2 ** min(api_try_count, 6)
                     sleep_time = random.randint(0, sleep_time)
 
-                if len(self.client_list) > 1:
+                if len(active_client_list) > 1:
                     token_info = f"[{token.maskToken()}]"
                 else:
                     token_info = ""
@@ -853,7 +944,9 @@ class BaseTranslate:
             return
         self._shutdown_done = True
 
-        for client, _ in getattr(self, "client_list", []):
+        all_clients = list(getattr(self, "client_list", []))
+        all_clients.extend(getattr(self, "proofread_client_list", []))
+        for client, _ in all_clients:
             if client is None:
                 continue
 

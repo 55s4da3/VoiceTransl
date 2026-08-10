@@ -31,6 +31,66 @@ class QtResponsivenessTests(unittest.TestCase):
             window.ai_resegment_checkbox.setChecked(True)
             self.assertTrue(window.ai_resegment_checkbox.isChecked())
             self.assertFalse(window.streaming_checkbox.isChecked())
+
+            window.gpt_model.setText('deepseek-v4-flash')
+            for provider in ('Deepseek', 'OpenAI', 'Kimi'):
+                self.assertGreaterEqual(
+                    window.ai_resegment_provider_combo.findData(provider), 0
+                )
+                self.assertGreaterEqual(
+                    window.proofread_provider_combo.findData(provider), 0
+                )
+            window._set_provider_value(
+                window.ai_resegment_provider_combo, 'Deepseek'
+            )
+            window._set_auxiliary_model_value(
+                window.ai_resegment_model_combo, 'deepseek-v4-pro'
+            )
+            self.assertEqual(
+                window.ai_resegment_provider_combo.currentData(),
+                'Deepseek',
+            )
+            self.assertEqual(
+                window.ai_resegment_model_combo.currentData(),
+                'deepseek-v4-pro',
+            )
+            window._set_provider_value(window.ai_resegment_provider_combo, 'OpenAI')
+            self.assertEqual(
+                window.ai_resegment_model_combo.findData('deepseek-v4-flash'), -1
+            )
+            self.assertFalse(window.ai_resegment_thinking_checkbox.isEnabled())
+            window._set_provider_value(window.ai_resegment_provider_combo, 'Deepseek')
+            window.ai_resegment_token.setText('resegment-key')
+            window._set_provider_value(
+                window.proofread_provider_combo, 'custom'
+            )
+            window._set_auxiliary_model_value(
+                window.proofread_model_combo, 'custom-proofreader'
+            )
+            self.assertEqual(
+                window.proofread_provider_combo.currentData(), 'custom'
+            )
+            self.assertTrue(window.proofread_model_combo.isEditable())
+            window.proofread_address.setText('https://proofread.example/v1')
+            window.proofread_token.setText('proofread-key')
+            window.deepseek_thinking_checkbox.setChecked(True)
+            window.ai_resegment_thinking_checkbox.setChecked(False)
+            window.proofread_thinking_checkbox.setChecked(True)
+            snapshot = window._capture_task_snapshot('run')
+            self.assertEqual(snapshot.get('gpt_model'), 'deepseek-v4-flash')
+            self.assertEqual(snapshot.get('ai_resegment_provider'), 'Deepseek')
+            self.assertEqual(snapshot.get('ai_resegment_model'), 'deepseek-v4-pro')
+            self.assertEqual(snapshot.get('ai_resegment_token'), 'resegment-key')
+            self.assertEqual(snapshot.get('proofread_provider'), 'custom')
+            self.assertEqual(snapshot.get('proofread_model'), 'custom-proofreader')
+            self.assertEqual(
+                snapshot.get('proofread_address'),
+                'https://proofread.example/v1',
+            )
+            self.assertEqual(snapshot.get('proofread_token'), 'proofread-key')
+            self.assertTrue(snapshot.get('deepseek_thinking'))
+            self.assertFalse(snapshot.get('ai_resegment_thinking'))
+            self.assertTrue(snapshot.get('proofread_thinking'))
         finally:
             window.close()
             self.qt_app.processEvents()
@@ -53,6 +113,35 @@ class QtResponsivenessTests(unittest.TestCase):
                 self.assertLess(max(b - a for a, b in zip(ticks, ticks[1:])), 0.25)
         finally:
             timer.stop()
+            window.close()
+            self.qt_app.processEvents()
+
+    def test_model_list_loading_does_not_open_hidden_modal_dialog(self):
+        window = self._window()
+        try:
+            models = [f'model-{index}' for index in range(500)]
+            window._set_provider_value(
+                window.ai_resegment_provider_combo, 'custom'
+            )
+            started = time.monotonic()
+            window._handle_model_list_loaded(models, 'resegment')
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertGreaterEqual(
+                window.ai_resegment_model_combo.findData('model-499'), 0
+            )
+            self.assertIsNone(
+                getattr(window, '_model_selection_dialog', None)
+            )
+
+            started = time.monotonic()
+            window.show_model_selection_dialog(['main-model'])
+            self.assertLess(time.monotonic() - started, 0.25)
+            dialog = window._model_selection_dialog
+            self.assertIsNotNone(dialog)
+            self.assertTrue(dialog.isVisible())
+            dialog.close()
+            self.qt_app.processEvents()
+        finally:
             window.close()
             self.qt_app.processEvents()
 

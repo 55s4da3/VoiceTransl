@@ -14,6 +14,10 @@ backendSpecific:
     checkAvailableConcurrency: 4 # checkAvailable阶段的并发检测数，避免启动时瞬时打满请求。[1-16]
     globalRequestRPM: 0 # 全局跨任务请求限速（每分钟请求数）。0表示不限制。[0-60000]
     thinkingMode: auto # 思考模式：auto沿用服务端默认，enabled开启，disabled关闭。[auto/enabled/disabled]
+    proofreadModelName: "" # 校对模型名，留空时跟随主翻译模型
+    proofreadEndpoint: "" # 校对 API 地址，留空时跟随主翻译地址
+    proofreadToken: "" # 校对 API Key，留空时跟随主翻译 Key
+    proofreadThinkingMode: auto # 校对模型的思考模式
     stream: true # 流式请求，一般不用修改除非接口不支持流式[True/False]
     apiTimeout: 120 # 请求超时时间，单位秒
     apiErrorWait: auto # 发生API Error时的等待时间，包括频率限制。auto将自动适应[auto/0-120]

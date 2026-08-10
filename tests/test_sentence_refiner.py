@@ -134,15 +134,27 @@ class SentenceRefinerTests(unittest.TestCase):
             result = request_openai_compatible(
                 "prompt",
                 endpoint=f"http://127.0.0.1:{server.server_port}",
-                model="test-model",
+                model="deepseek-v4-flash",
                 api_key="test-token",
                 cancel_token=CancellationToken(),
+                thinking_enabled=True,
             )
+            self.assertIn('"text":"hello"', result)
+            self.assertTrue(seen["body"]["stream"])
+            self.assertEqual(seen["body"]["thinking"], {"type": "enabled"})
+
+            request_openai_compatible(
+                "prompt",
+                endpoint=f"http://127.0.0.1:{server.server_port}",
+                model="qwen3-235b",
+                api_key="test-token",
+                cancel_token=CancellationToken(),
+                thinking_enabled=False,
+            )
+            self.assertFalse(seen["body"]["enable_thinking"])
         finally:
             server.shutdown()
             server.server_close()
-        self.assertIn('"text":"hello"', result)
-        self.assertTrue(seen["body"]["stream"])
 
 
 if __name__ == "__main__":
