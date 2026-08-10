@@ -62,11 +62,16 @@ TRANSLATIONS = {
         "io_segment_checkbox": "启用音频分段处理（长音频分段后听写翻译再合并）",
         "io_segment_duration_label": "分段时长（分钟）：",
         "io_streaming_checkbox": "实验：边听写边在线翻译",
+        "io_ai_resegment_checkbox": "AI 全量整理断句",
+        "io_ai_resegment_tooltip": "完整识别后使用当前在线模型合并碎句并重新拆分长句；与流式翻译互斥。",
         "io_proofread_checkbox": "翻译完成后全量校对",
         "io_proofread_tooltip": "将当前文件的全部译文一次性提交给语言模型校对；超长失败时会自动拆分重试。",
         "status_streaming_start": "[STREAM] 正在启动流式识别翻译流水线...",
         "status_streaming_done": "[STREAM] 流水线完成：{count}句，首批译文 {first:.1f}秒，ASR {asr:.1f}秒，发生重叠={overlap}，总计 {total:.1f}秒",
         "status_streaming_fallback": "[WARN] 流式模式仅支持 Faster-Whisper + 在线翻译 + 不对齐，已回退普通流程。",
+        "status_ai_resegment_start": "[INFO] 正在对整份原文进行 AI 断句整理（{count} 条）...",
+        "status_ai_resegment_done": "[INFO] AI 断句整理完成，共 {count} 条。",
+        "status_ai_resegment_unsupported": "[WARN] 当前本地翻译模型不支持可靠的 AI 断句输出，已保留原断句。",
         "io_run_btn": "🚀 运行",
         "io_cancel_btn": "⛔ 取消任务",
         "io_open_output_btn": "📁 打开输出目录",
@@ -408,11 +413,16 @@ TRANSLATIONS = {
         "io_segment_checkbox": "Enable audio segment processing (split long audio for transcription/translation then merge)",
         "io_segment_duration_label": "Segment duration (minutes):",
         "io_streaming_checkbox": "Experimental: translate while transcribing",
+        "io_ai_resegment_checkbox": "AI full-file sentence restructuring",
+        "io_ai_resegment_tooltip": "After transcription, use the configured online model to merge fragments and split long captions; incompatible with streaming translation.",
         "io_proofread_checkbox": "Proofread all translations when finished",
         "io_proofread_tooltip": "Submits every translated line in the current file as one proofreading request; an oversized failed response is retried in smaller parts.",
         "status_streaming_start": "[STREAM] Starting streaming ASR/translation pipeline...",
         "status_streaming_done": "[STREAM] Pipeline complete: {count} segments, first translation {first:.1f}s, ASR {asr:.1f}s, overlapped={overlap}, total {total:.1f}s",
         "status_streaming_fallback": "[WARN] Streaming requires Faster-Whisper, online translation, and no alignment; using the normal flow.",
+        "status_ai_resegment_start": "[INFO] AI is restructuring the full transcript ({count} entries)...",
+        "status_ai_resegment_done": "[INFO] AI sentence restructuring completed with {count} entries.",
+        "status_ai_resegment_unsupported": "[WARN] The selected local translator cannot reliably restructure sentences; original segmentation was kept.",
         "io_run_btn": "🚀 Run",
         "io_cancel_btn": "⛔ Cancel Task",
         "io_open_output_btn": "📁 Open Output Directory",
@@ -753,11 +763,16 @@ TRANSLATIONS = {
         "io_segment_checkbox": "音声セグメント処理を有効化（長い音声を分割して文字起こし・翻訳後に結合）",
         "io_segment_duration_label": "セグメント長（分）：",
         "io_streaming_checkbox": "実験：文字起こしと同時にオンライン翻訳",
+        "io_ai_resegment_checkbox": "AIで全文の文分割を整理",
+        "io_ai_resegment_tooltip": "文字起こし完了後、設定中のオンラインモデルで断片を結合し長い字幕を再分割します。ストリーミング翻訳とは併用できません。",
         "io_proofread_checkbox": "翻訳完了後に全文を校正",
         "io_proofread_tooltip": "現在のファイルの全訳文を1回のリクエストで校正し、長すぎて失敗した場合は自動的に分割して再試行します。",
         "status_streaming_start": "[STREAM] ストリーミング文字起こし・翻訳を開始しています...",
         "status_streaming_done": "[STREAM] 完了：{count}件、初回翻訳 {first:.1f}秒、ASR {asr:.1f}秒、重複実行={overlap}、合計 {total:.1f}秒",
         "status_streaming_fallback": "[WARN] ストリーミングは Faster-Whisper・オンライン翻訳・アラインなしの場合のみ対応しています。通常処理に戻します。",
+        "status_ai_resegment_start": "[INFO] 全文のAI文分割整理を開始します（{count}件）...",
+        "status_ai_resegment_done": "[INFO] AI文分割整理が完了しました（{count}件）。",
+        "status_ai_resegment_unsupported": "[WARN] 選択中のローカル翻訳モデルでは安定した文分割ができないため、元の分割を保持しました。",
         "io_run_btn": "🚀 実行",
         "io_cancel_btn": "⛔ タスクキャンセル",
         "io_open_output_btn": "📁 出力ディレクトリを開く",
@@ -1039,6 +1054,11 @@ TRANSLATIONS = {
         "status_crispasr_param_save_error": "[WARN] [CrispASR] コマンドテンプレートを保存できません。現在の設定で続行します：{error}",
     },
 }
+
+from qwen_ui_i18n import QWEN_UI_TRANSLATIONS
+
+for _language_code, _ui_strings in QWEN_UI_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_language_code, {}).update(_ui_strings)
 
 
 def get_language():

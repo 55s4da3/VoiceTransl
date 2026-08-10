@@ -8,7 +8,11 @@ import json
 import os
 import subprocess
 import sys
+import queue
+import threading
 from pathlib import Path
+
+from tasking import CancellationToken, ProcessRegistry, TaskCancelledError, background_creation_flags
 
 # PyInstaller 打包后使用独立 exe，源码运行时使用 python -m asrlabs
 _FROZEN = hasattr(sys, '_MEIPASS')
@@ -48,7 +52,7 @@ def _run_asrlabs_json(args: list[str], timeout: int = 30) -> str:
     Returns:
         stdout 输出文本
     """
-    creationflags = 0x08000000 if os.name == 'nt' else 0
+    creationflags = background_creation_flags()
     proc = subprocess.run(
         [*_ASRLABS_CMD, *args],
         capture_output=True, text=True,
@@ -240,30 +244,46 @@ def _run_with_log(cmd, msg_queue, stop_event, output_dir, output_name) -> str:
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
 
-    creationflags = 0x08000000 if os.name == 'nt' else 0
-    proc = subprocess.Popen(
+    registry = ProcessRegistry(CancellationToken(stop_event))
+    proc = registry.popen(
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, creationflags=creationflags, bufsize=1,
+        text=True, bufsize=1,
         env=_build_subprocess_env(),
     )
 
-    # 逐行读取输出并转发到消息队列
-    for line in iter(proc.stdout.readline, ''):
-        if stop_event.is_set():
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-            break
+    lines: queue.Queue = queue.Queue()
 
+    def read_output():
+        try:
+            for line in iter(proc.stdout.readline, ''):
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    reader_done = False
+    while not reader_done or not lines.empty():
+        if stop_event.is_set():
+            registry.terminate(proc)
+            raise TaskCancelledError()
+        try:
+            line = lines.get(timeout=0.1)
+        except queue.Empty:
+            if proc.poll() is not None and not reader.is_alive():
+                reader_done = True
+            continue
+        if line is None:
+            reader_done = True
+            continue
         cleaned = line.rstrip('\n\r')
         if cleaned.strip():
             msg_queue.put("detail", f"[ASRLabs] {cleaned}")
 
-    proc.stdout.close()
-    retcode = proc.wait()
+    if proc.stdout:
+        proc.stdout.close()
+    retcode = registry.wait(proc)
 
     if retcode != 0:
         raise RuntimeError(f"asrlabs 子进程失败 (exit={retcode})")
@@ -301,6 +321,19 @@ def convert_to_galtransl_json(asrlabs_json_path: str, output_path: str):
             'end': seg.get('end', 0.0),
             'message': text,
         })
+        words = []
+        for word in seg.get('words', []) or []:
+            if not isinstance(word, dict):
+                continue
+            word_text = word.get('word', word.get('text', ''))
+            if word_text and word.get('start') is not None and word.get('end') is not None:
+                words.append({
+                    'word': str(word_text),
+                    'start': float(word['start']),
+                    'end': float(word['end']),
+                })
+        if words:
+            galtransl_data[-1]['words'] = words
 
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(galtransl_data, f, ensure_ascii=False, indent=4)

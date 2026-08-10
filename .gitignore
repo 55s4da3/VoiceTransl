@@ -17,6 +17,7 @@ project/
 *.log
 .env
 gui_settings.yaml
+gui_settings.legacy*.yaml
 *.dll
 *.exe
 useful_tools/GalTransl_DumpInjector/config.ini
@@ -26,6 +27,5 @@ useful_tools/GalTransl_DumpInjector/VNTextPatch/names.xml
 models/
 *.gguf
 
-# Tests
-tests
+# Tests are source-controlled; their runtime caches remain ignored above.
 separate
