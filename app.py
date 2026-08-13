@@ -1,7 +1,9 @@
 import sys, os
 import json
+import hashlib
 import re
 import shutil
+import socket
 import threading
 import yaml
 from pathlib import Path
@@ -26,6 +28,7 @@ from log import UIMessageQueue, _line_passes_filter
 from pool import ConcurrentTranslationPool
 from worker import MainWorker
 from tasking import CancellationToken, TaskSnapshot
+from lan_service import DEFAULT_HTTP_PORT, LanService, build_artifact
 from i18n import _, set_language, get_language
 from PySide6 import QtGui, QtCore
 from PySide6.QtCore import QThread, Signal, QTimer
@@ -210,6 +213,8 @@ def apply_material_theme(application: QApplication, theme: str) -> None:
 class MainWindow(QMainWindow):
     status = Signal(str)
     config_write_status = Signal(str)
+    lan_job_ready = Signal(str)
+    lan_cancel_requested = Signal(str)
 
     @staticmethod
     def default_output_dir() -> str:
@@ -232,6 +237,15 @@ class MainWindow(QMainWindow):
         self._suppress_auto_save = True
         self._config_write_lock = threading.Lock()
         self._config_write_generation = 0
+        self.lan_service = None
+        self._lan_profile_lock = threading.RLock()
+        self._lan_profile_cache = {"public": {}, "snapshot": {}}
+        self._lan_job_queue = []
+        self._active_lan_job_id = None
+        self._lan_task_outcomes = {}
+        self._lan_shutdown_started = False
+        self.lan_job_ready.connect(self._on_lan_job_ready)
+        self.lan_cancel_requested.connect(self._on_lan_cancel_requested)
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
         self._auto_save_timer.setInterval(200)
@@ -248,6 +262,7 @@ class MainWindow(QMainWindow):
         self.initUI()
         self._log_level_filter = 'ALL'  # 日志级别过滤默认值
         self.setup_timer()
+        self._initialize_lan_service()
 
     def _load_ui_language(self):
         """从 gui_settings.yaml 加载已保存的界面语言，在任何 _() 调用之前执行"""
@@ -275,6 +290,7 @@ class MainWindow(QMainWindow):
         """执行静默自动保存"""
         try:
             self.save_config(silent=True)
+            self._refresh_lan_profile_cache()
         except Exception:
             pass
 
@@ -377,6 +393,22 @@ class MainWindow(QMainWindow):
             'ui_language': current_lang,
             'ui_theme': ui_theme,
             'target_translation_lang': target_translation_lang,
+            'lan_enabled': bool(
+                self.lan_enabled_checkbox.isChecked()
+                if hasattr(self, 'lan_enabled_checkbox') else False
+            ),
+            'lan_auto_start': bool(
+                self.lan_auto_start_checkbox.isChecked()
+                if hasattr(self, 'lan_auto_start_checkbox') else False
+            ),
+            'lan_port': int(
+                self.lan_port_spin.value()
+                if hasattr(self, 'lan_port_spin') else DEFAULT_HTTP_PORT
+            ),
+            'lan_device_name': (
+                self.lan_device_name_edit.text().strip()
+                if hasattr(self, 'lan_device_name_edit') else 'VoiceTransl'
+            ),
         }
         file_contents = {
             'crispasr/param.txt': self.param_crispasr.toPlainText(),
@@ -843,13 +875,64 @@ class MainWindow(QMainWindow):
         self._style_section(self.advanced_settings_tab, _("config_translation_title"))
         self.param_crispasr.setMaximumHeight(130)
         self.param_llama.setMaximumHeight(120)
+        self.lan_settings_section = self._build_lan_config_section()
 
         scroll, grid = self._scrollable_grid()
         grid.addWidget(self.settings_tab, 0, 0)
         grid.addWidget(self.advanced_settings_tab, 1, 0)
+        grid.addWidget(self.lan_settings_section, 2, 0)
         grid.setColumnStretch(0, 1)
-        grid.setRowStretch(2, 1)
+        grid.setRowStretch(3, 1)
         layout.addWidget(scroll, 1)
+
+    def _build_lan_config_section(self):
+        section = Widget("LanService", self)
+        layout = section.vBoxLayout
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(8)
+        layout.addWidget(SubtitleLabel(_("lan_title")))
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        self.lan_enabled_checkbox = QCheckBox(_("lan_enabled"))
+        self.lan_auto_start_checkbox = QCheckBox(_("lan_auto_start"))
+        self.lan_port_spin = QSpinBox()
+        self.lan_port_spin.setRange(1024, 65535)
+        self.lan_port_spin.setValue(DEFAULT_HTTP_PORT)
+        self.lan_device_name_edit = QLineEdit(socket.gethostname() or "VoiceTransl")
+        grid.addWidget(self.lan_enabled_checkbox, 0, 0)
+        grid.addWidget(self.lan_auto_start_checkbox, 0, 1)
+        grid.addWidget(BodyLabel(_("lan_device_name")), 0, 2)
+        grid.addWidget(self.lan_device_name_edit, 0, 3)
+        grid.addWidget(BodyLabel(_("lan_port")), 0, 4)
+        grid.addWidget(self.lan_port_spin, 0, 5)
+
+        self.lan_status_label = BodyLabel(_("lan_status_stopped"))
+        self.lan_address_label = BodyLabel("")
+        self.lan_pair_code_label = BodyLabel(_("lan_pair_code", code="------"))
+        grid.addWidget(self.lan_status_label, 1, 0, 1, 2)
+        grid.addWidget(self.lan_address_label, 1, 2, 1, 2)
+        grid.addWidget(self.lan_pair_code_label, 1, 4, 1, 2)
+
+        self.lan_start_button = QPushButton(_("lan_restart"))
+        self.lan_rotate_code_button = QPushButton(_("lan_rotate_code"))
+        self.lan_devices_combo = QComboBox()
+        self.lan_devices_combo.setMinimumWidth(180)
+        self.lan_revoke_button = QPushButton(_("lan_revoke"))
+        grid.addWidget(self.lan_start_button, 2, 0)
+        grid.addWidget(self.lan_rotate_code_button, 2, 1)
+        grid.addWidget(BodyLabel(_("lan_paired_devices")), 2, 2)
+        grid.addWidget(self.lan_devices_combo, 2, 3, 1, 2)
+        grid.addWidget(self.lan_revoke_button, 2, 5)
+        grid.setColumnStretch(3, 1)
+        layout.addLayout(grid)
+
+        self.lan_enabled_checkbox.toggled.connect(self._on_lan_enabled_toggled)
+        self.lan_start_button.clicked.connect(self._restart_lan_service)
+        self.lan_rotate_code_button.clicked.connect(self._rotate_lan_pair_code)
+        self.lan_revoke_button.clicked.connect(self._revoke_lan_device)
+        return section
 
     def _build_dictionary_page(self):
         DICTIONARY_PRESET_DIR.mkdir(parents=True, exist_ok=True)
@@ -1321,11 +1404,14 @@ class MainWindow(QMainWindow):
         show_model_dialog: bool = False,
         snapshot_overrides: dict | None = None,
         model_target: str | None = None,
+        prepared_snapshot: TaskSnapshot | None = None,
+        message_queue=None,
+        lan_job_id: str | None = None,
     ):
         if self.thread is not None and self.thread.isRunning():
             self._emit_status(_("status_task_busy"))
             return
-        snapshot = self._capture_task_snapshot(operation)
+        snapshot = prepared_snapshot or self._capture_task_snapshot(operation)
         if snapshot_overrides:
             values = dict(snapshot.values)
             values.update(snapshot_overrides)
@@ -1333,7 +1419,9 @@ class MainWindow(QMainWindow):
         self._set_progress_context(task_name)
         self.thread = QThread()
         self.cancel_token = CancellationToken()
-        self.worker = MainWorker(snapshot, self.msg_queue, self.cancel_token)
+        self.worker = MainWorker(
+            snapshot, message_queue or self.msg_queue, self.cancel_token
+        )
         self.worker.moveToThread(self.thread)
         # Connect to a real QObject slot. Connecting a decorated Python method
         # directly can make PySide invoke it in the GUI thread.
@@ -1341,6 +1429,11 @@ class MainWindow(QMainWindow):
         self.worker.status.connect(self._on_worker_status)
         if hasattr(self.worker, 'outcome'):
             self.worker.outcome.connect(self._on_task_outcome)
+            if lan_job_id:
+                self.worker.outcome.connect(
+                    lambda outcome, job_id=lan_job_id:
+                    self._record_lan_outcome(job_id, outcome)
+                )
         if show_model_dialog:
             self.worker.show_model_dialog.connect(
                 lambda models, target=model_target:
@@ -1458,12 +1551,19 @@ class MainWindow(QMainWindow):
 
     def _on_worker_thread_finished(self):
         thread = self.sender()
+        completed_lan_job = None
         if self.thread is thread:
+            completed_lan_job = self._active_lan_job_id
             self.thread = None
             self.worker = None
             self.cancel_token = None
+            self._active_lan_job_id = None
+        if completed_lan_job:
+            self._finalize_lan_job(completed_lan_job)
         if self._pending_close:
             QTimer.singleShot(0, self.close)
+        elif self._lan_job_queue:
+            QTimer.singleShot(0, self._start_next_lan_job)
 
     def browse_synth_video(self):
         files, _unused = QFileDialog.getOpenFileNames(self, _("dialog_select_video"), "", "Video Files (*.mp4 *.mkv *.avi *.mov *.flv);;All Files (*)")
@@ -2129,6 +2229,19 @@ class MainWindow(QMainWindow):
                 _tl_idx = self.target_lang.findData(gui_settings.get('target_translation_lang', 'zh-cn'))
                 if _tl_idx >= 0:
                     self.target_lang.setCurrentIndex(_tl_idx)
+            if hasattr(self, 'lan_port_spin'):
+                self.lan_port_spin.setValue(
+                    int(gui_settings.get('lan_port', DEFAULT_HTTP_PORT))
+                )
+                self.lan_device_name_edit.setText(
+                    str(gui_settings.get('lan_device_name', socket.gethostname() or 'VoiceTransl'))
+                )
+                self.lan_auto_start_checkbox.setChecked(
+                    bool(gui_settings.get('lan_auto_start', False))
+                )
+                self.lan_enabled_checkbox.setChecked(
+                    bool(gui_settings.get('lan_enabled', False))
+                )
 
         # API Key 始终从 .env 加载
         api_key = _load_api_key()
@@ -2197,6 +2310,287 @@ class MainWindow(QMainWindow):
             self._suppress_auto_save = False
         if fresh_config:
             self.save_config(silent=True)
+
+    def _refresh_lan_profile_cache(self):
+        if not hasattr(self, 'asr_provider_combo'):
+            return
+        snapshot = self._capture_task_snapshot('run')
+        values = dict(snapshot.values)
+        asr_config = dict(values.get('asr_config', {}))
+        provider = asr_config.get('provider', 'crispasr')
+        asr_model = (
+            asr_config.get('crispasr_model', '')
+            if provider == 'crispasr'
+            else asr_config.get('asr_model', '')
+        )
+        ready = bool(
+            values.get('enable_transcription')
+            and values.get('enable_translation')
+            and asr_model
+            and values.get('translator') not in ('', NO_TRANSLATION)
+        )
+        public = {
+            'api_version': 1,
+            'asr_provider': provider,
+            'asr_engine': (
+                asr_config.get('crispasr_backend', '')
+                if provider == 'crispasr'
+                else asr_config.get('asr_engine', '')
+            ),
+            'asr_model': os.path.basename(str(asr_model)),
+            'source_language': str(values.get('language', 'ja')),
+            'target_language': str(values.get('target_lang', 'zh-cn')),
+            'translator': str(values.get('translator', '')),
+            'translation_model': str(values.get('gpt_model', '')),
+            'ai_resegment': bool(values.get('enable_ai_resegment', False)),
+            'proofread': bool(values.get('enable_proofread', False)),
+            'streaming': bool(values.get('enable_streaming', False)),
+            'output': 'bilingual_srt',
+            'ready': ready,
+        }
+        revision_source = json.dumps(public, ensure_ascii=False, sort_keys=True)
+        public['revision'] = hashlib.sha256(
+            revision_source.encode('utf-8')
+        ).hexdigest()[:16]
+        with self._lan_profile_lock:
+            self._lan_profile_cache = {
+                'public': json.loads(json.dumps(public, ensure_ascii=False)),
+                'snapshot': values,
+            }
+
+    def _lan_profile_provider(self):
+        with self._lan_profile_lock:
+            return {
+                'public': dict(self._lan_profile_cache.get('public', {})),
+                'snapshot': dict(self._lan_profile_cache.get('snapshot', {})),
+            }
+
+    @staticmethod
+    def _local_ipv4_addresses():
+        addresses = set()
+        try:
+            for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                address = item[4][0]
+                if not address.startswith('127.'):
+                    addresses.add(address)
+        except OSError:
+            pass
+        return sorted(addresses)
+
+    def _new_lan_service(self):
+        return LanService(
+            root=Path('project') / 'cache' / 'lan_jobs',
+            profile_provider=self._lan_profile_provider,
+            job_ready=lambda job_id: self.lan_job_ready.emit(job_id),
+            cancel_job=lambda job_id: self.lan_cancel_requested.emit(job_id),
+            device_name=self.lan_device_name_edit.text().strip() or 'VoiceTransl',
+            port=self.lan_port_spin.value(),
+            state_dir=Path('project') / 'cache' / 'lan_state',
+        )
+
+    def _initialize_lan_service(self):
+        self._refresh_lan_profile_cache()
+        self.lan_service = self._new_lan_service()
+        should_start = bool(
+            self.lan_enabled_checkbox.isChecked()
+            or self.lan_auto_start_checkbox.isChecked()
+        )
+        if should_start:
+            self._start_lan_service()
+        else:
+            self._refresh_lan_ui()
+        self._lan_ui_timer = QTimer(self)
+        self._lan_ui_timer.timeout.connect(self._refresh_lan_ui)
+        self._lan_ui_timer.start(1000)
+
+    def _start_lan_service(self):
+        try:
+            if self.lan_service is None:
+                self.lan_service = self._new_lan_service()
+            self.lan_service.start()
+            self.lan_enabled_checkbox.blockSignals(True)
+            self.lan_enabled_checkbox.setChecked(True)
+            self.lan_enabled_checkbox.blockSignals(False)
+            self._refresh_lan_ui()
+            self._schedule_auto_save()
+        except Exception as error:
+            self.lan_enabled_checkbox.blockSignals(True)
+            self.lan_enabled_checkbox.setChecked(False)
+            self.lan_enabled_checkbox.blockSignals(False)
+            self.lan_status_label.setText(_("lan_status_error", error=error))
+            self._emit_status(_("lan_status_error", error=error))
+
+    def _stop_lan_service(self):
+        service = self.lan_service
+        if service is not None:
+            service.stop()
+        self.lan_enabled_checkbox.blockSignals(True)
+        self.lan_enabled_checkbox.setChecked(False)
+        self.lan_enabled_checkbox.blockSignals(False)
+        self._refresh_lan_ui()
+        self._schedule_auto_save()
+
+    def _restart_lan_service(self):
+        try:
+            if self.lan_service is not None:
+                self.lan_service.stop()
+            self.lan_service = self._new_lan_service()
+            self._start_lan_service()
+        except Exception as error:
+            self.lan_status_label.setText(_("lan_status_error", error=error))
+
+    def _on_lan_enabled_toggled(self, enabled):
+        if self._suppress_auto_save or self.lan_service is None:
+            return
+        if enabled:
+            self._restart_lan_service()
+        else:
+            self._stop_lan_service()
+
+    def _rotate_lan_pair_code(self):
+        if self.lan_service and self.lan_service.running:
+            self.lan_service.rotate_pair_code()
+            self._refresh_lan_ui()
+
+    def _revoke_lan_device(self):
+        if not self.lan_service:
+            return
+        device_id = self.lan_devices_combo.currentData()
+        if device_id:
+            self.lan_service.revoke(str(device_id))
+            self._refresh_lan_ui()
+
+    def _refresh_lan_ui(self):
+        if not hasattr(self, 'lan_status_label'):
+            return
+        service = self.lan_service
+        running = bool(service and service.running)
+        self.lan_status_label.setText(
+            _("lan_status_running") if running else _("lan_status_stopped")
+        )
+        addresses = self._local_ipv4_addresses()
+        port = service.port if service else self.lan_port_spin.value()
+        self.lan_address_label.setText(
+            _("lan_address", address=(addresses[0] if addresses else '127.0.0.1'), port=port)
+        )
+        self.lan_pair_code_label.setText(
+            _("lan_pair_code", code=(service.pair_code if running else '------'))
+        )
+        current = self.lan_devices_combo.currentData()
+        devices = service.paired_devices() if service else []
+        self.lan_devices_combo.blockSignals(True)
+        self.lan_devices_combo.clear()
+        for device in devices:
+            self.lan_devices_combo.addItem(device['name'], userData=device['id'])
+        if current:
+            index = self.lan_devices_combo.findData(current)
+            if index >= 0:
+                self.lan_devices_combo.setCurrentIndex(index)
+        self.lan_devices_combo.blockSignals(False)
+        self.lan_revoke_button.setEnabled(bool(devices))
+
+    def _on_lan_job_ready(self, job_id):
+        if not self.lan_service:
+            return
+        job = self.lan_service.registry.public(job_id)
+        if not job or job.get('state') != 'queued':
+            return
+        if job_id not in self._lan_job_queue and job_id != self._active_lan_job_id:
+            self._lan_job_queue.append(job_id)
+        self._start_next_lan_job()
+
+    def _start_next_lan_job(self):
+        if self.thread is not None and self.thread.isRunning():
+            return
+        if not self.lan_service:
+            return
+        while self._lan_job_queue:
+            job_id = self._lan_job_queue.pop(0)
+            job = self.lan_service.registry.public(job_id)
+            snapshot_values = self.lan_service.registry.snapshot(job_id)
+            if not job or job.get('state') != 'queued':
+                continue
+            if not snapshot_values:
+                self.lan_service.registry.update(
+                    job_id, state='failed', phase='failed', error='Task snapshot is unavailable'
+                )
+                continue
+            input_path, output_dir = self.lan_service.registry.paths(job_id)
+            snapshot_values.update({
+                'input_files': str(input_path),
+                'output_dir': str(output_dir),
+                'use_input_dir': False,
+                'output_format': '双语SRT',
+                'auto_shutdown': False,
+            })
+            snapshot = TaskSnapshot(operation='run', values=snapshot_values)
+            self._active_lan_job_id = job_id
+            self._lan_task_outcomes[job_id] = 'running'
+            self.lan_service.registry.update(
+                job_id, state='running', phase='starting', current=0, total=1
+            )
+            queue = self.lan_service.forwarding_queue(self.msg_queue, job_id)
+            self._start_worker_task(
+                'run', _("lan_task_name", filename=job.get('filename', '')),
+                prepared_snapshot=snapshot,
+                message_queue=queue,
+                lan_job_id=job_id,
+            )
+            return
+
+    def _record_lan_outcome(self, job_id, outcome):
+        self._lan_task_outcomes[job_id] = str(outcome or 'error')
+
+    def _finalize_lan_job(self, job_id):
+        service = self.lan_service
+        if not service:
+            return
+        outcome = self._lan_task_outcomes.pop(job_id, 'error')
+        if outcome != 'success':
+            state = 'cancelled' if outcome == 'cancelled' else 'failed'
+            service.registry.update(
+                job_id, state=state, phase=state,
+                error='' if state == 'cancelled' else 'VoiceTransl task failed',
+            )
+            return
+        job = service.registry.public(job_id) or {}
+        _input, output_dir = service.registry.paths(job_id)
+        profile = job.get('profile', {})
+        source_language = str(profile.get('source_language', ''))
+        target_language = str(profile.get('target_language', ''))
+        all_srt = sorted(output_dir.rglob('*.srt'), key=lambda path: path.stat().st_mtime)
+        combined = [path for path in all_srt if path.name.endswith('.combine.srt')]
+        translated = [path for path in all_srt if path.name.endswith('.tg.srt')]
+        originals = [
+            path for path in all_srt
+            if not path.name.endswith('.combine.srt') and not path.name.endswith('.tg.srt')
+        ]
+        artifacts = []
+        if combined:
+            artifacts.append(build_artifact(combined[-1], 'combined'))
+        if originals:
+            artifacts.append(build_artifact(originals[-1], 'source', source_language))
+        if translated:
+            artifacts.append(build_artifact(translated[-1], 'target', target_language))
+        if not artifacts:
+            service.registry.update(
+                job_id, state='failed', phase='failed', error='No SRT output was generated'
+            )
+            return
+        service.registry.set_artifacts(job_id, artifacts)
+
+    def _on_lan_cancel_requested(self, job_id):
+        if not self.lan_service:
+            return
+        if job_id in self._lan_job_queue:
+            self._lan_job_queue = [item for item in self._lan_job_queue if item != job_id]
+            self.lan_service.registry.update(
+                job_id, state='cancelled', phase='cancelled', error=''
+            )
+            return
+        if self._active_lan_job_id == job_id and self.cancel_token:
+            self.cancel_token.cancel()
+            self.lan_service.registry.update(job_id, phase='cancelling')
 
     def setup_timer(self):
         self.timer = QTimer(self)
@@ -2351,6 +2745,19 @@ class MainWindow(QMainWindow):
             self.save_config(silent=True)
         except Exception:
             pass
+        if not self._lan_shutdown_started and self.lan_service is not None:
+            self._lan_shutdown_started = True
+            service = self.lan_service
+            for job_id in list(self._lan_job_queue):
+                service.registry.update(
+                    job_id, state='cancelled', phase='cancelled', error=''
+                )
+            self._lan_job_queue.clear()
+            threading.Thread(
+                target=service.stop,
+                name='voicetransl-lan-stop',
+                daemon=True,
+            ).start()
         if self.thread and self.thread.isRunning():
             self._pending_close = True
             self.cancel_task()
