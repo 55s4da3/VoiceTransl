@@ -20,7 +20,6 @@ PySide6
 qt-material
 pyinstaller
 openai
-torch
 librosa
 onnx
 soundfile
