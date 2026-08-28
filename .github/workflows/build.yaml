@@ -35,11 +35,6 @@ jobs:
             llama_variant: cuda-12.4
             spec: app.spec
             requirements: requirements.txt
-          - os: macos-latest
-            package_suffix: macos
-            llama_variant: macos
-            spec: app-macos.spec
-            requirements: requirements-macos.txt
     steps:
       - uses: actions/checkout@v4
 
@@ -138,41 +133,6 @@ jobs:
           Set-Content -LiteralPath 'llama/param.txt' -Encoding utf8 -Value 'llama/llama-server -m llama/$model_file -ngl $num_layers --port $port'
           Set-Content -LiteralPath 'crispasr/param.txt' -Encoding utf8 -Value '$crispasr_executable --backend $backend --model $model_file --aligner-model $aligner_file --force-aligner --language $language --output-srt --output-file $output_file --file $input_file --vad --vad-max-speech-duration-s 12 --vad-min-silence-duration-ms 200 --max-new-tokens 96 --frequency-penalty 0.8'
 
-      - name: Download llama-server and CrispASR (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          native_root="$RUNNER_TEMP/voicetransl-native"
-          mkdir -p "$native_root/llama-extracted" "$native_root/crispasr-extracted" llama crispasr
-
-          case "$(uname -m)" in
-            arm64) llama_arch='arm64' ;;
-            x86_64) llama_arch='x64' ;;
-            *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-
-          llama_archive="$native_root/llama.tar.gz"
-          llama_url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_VERSION}/llama-${LLAMA_CPP_VERSION}-bin-macos-${llama_arch}.tar.gz"
-          curl --fail --location --retry 3 "$llama_url" --output "$llama_archive"
-          tar -xzf "$llama_archive" -C "$native_root/llama-extracted"
-          llama_server="$(find "$native_root/llama-extracted" -type f -name 'llama-server' -print -quit)"
-          test -n "$llama_server" || { echo 'llama-server was not found in the downloaded llama.cpp archive' >&2; exit 1; }
-          cp -R "$(dirname "$llama_server")/." llama/
-          chmod +x llama/llama-server
-
-          crisp_archive="$native_root/crispasr.tar.gz"
-          crisp_url="https://github.com/CrispStrobe/CrispASR/releases/download/${CRISPASR_VERSION}/crispasr-macos.tar.gz"
-          curl --fail --location --retry 3 "$crisp_url" --output "$crisp_archive"
-          tar -xzf "$crisp_archive" -C "$native_root/crispasr-extracted"
-          crisp_executable="$(find "$native_root/crispasr-extracted" -type f -name 'crispasr' -print -quit)"
-          test -n "$crisp_executable" || { echo 'crispasr was not found in the downloaded CrispASR archive' >&2; exit 1; }
-          cp -R "$(dirname "$crisp_executable")/." crispasr/
-          chmod +x crispasr/crispasr
-
-          printf '%s\n' 'llama/llama-server -m llama/$model_file -ngl $num_layers --port $port' > llama/param.txt
-          printf '%s\n' '$crispasr_executable --backend $backend --model $model_file --aligner-model $aligner_file --force-aligner --language $language --output-srt --output-file $output_file --file $input_file --vad --vad-max-speech-duration-s 12 --vad-min-silence-duration-ms 200 --max-new-tokens 96 --frequency-penalty 0.8' > crispasr/param.txt
-
       - name: Build auxiliary executables
         run: |
           python -m PyInstaller --clean --noconfirm separate.spec --distpath .
@@ -205,18 +165,6 @@ jobs:
             $matches | ForEach-Object { Write-Host "Bundled $fileName -> $($_.FullName)" }
           }
 
-      - name: Verify bundled executables (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          for executable in translate separate llama-server crispasr; do
-            bundled_path="$(find dist -type f -name "$executable" -print -quit)"
-            test -n "$bundled_path" || { echo "Required bundled executable is missing: $executable" >&2; exit 1; }
-            test -x "$bundled_path" || { echo "Bundled file is not executable: $bundled_path" >&2; exit 1; }
-            echo "Bundled $executable -> $bundled_path"
-          done
-
       - name: Package Windows app
         if: runner.os == 'Windows'
         shell: pwsh
@@ -232,36 +180,6 @@ jobs:
             throw "Windows app archive was not created: $archivePath"
           }
           Get-Item -LiteralPath $archivePath | Format-List FullName, Length
-
-      - name: Package macOS folder without app bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -d dist/VoiceTransl || { echo 'dist/VoiceTransl is missing' >&2; exit 1; }
-
-          echo 'PyInstaller output sizes before packaging:'
-          du -sh dist/VoiceTransl dist/VoiceTransl.app
-
-          mkdir -p artifact
-          ditto -c -k --norsrc --keepParent \
-            dist/VoiceTransl "artifact/${PACKAGE_NAME}.zip"
-
-          archive="artifact/${PACKAGE_NAME}.zip"
-          test -s "$archive" || { echo 'macOS folder archive is empty' >&2; exit 1; }
-          archive_listing="$RUNNER_TEMP/${PACKAGE_NAME}-contents.txt"
-          unzip -Z1 "$archive" > "$archive_listing"
-          grep -q '^VoiceTransl/' "$archive_listing" || { echo 'VoiceTransl folder is missing from the macOS archive' >&2; exit 1; }
-          if grep -qv '^VoiceTransl/' "$archive_listing"; then
-            echo 'The macOS archive must only contain the VoiceTransl folder' >&2
-            exit 1
-          fi
-          if grep -q '\.app/' "$archive_listing"; then
-            echo 'The macOS archive must not contain an app bundle' >&2
-            exit 1
-          fi
-          echo 'Final macOS archive:'
-          ls -lh "$archive"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -292,7 +210,6 @@ jobs:
           set -euo pipefail
           test -s "release/VoiceTransl-${GITHUB_REF_NAME}-win.zip"
           test -s "release/VoiceTransl-${GITHUB_REF_NAME}-win-cuda.zip"
-          test -s "release/VoiceTransl-${GITHUB_REF_NAME}-macos.zip"
 
           # GitHub Releases limits each asset to less than 2 GiB. The CUDA
           # package is larger, so convert it to a standard split ZIP that can

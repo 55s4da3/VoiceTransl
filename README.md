@@ -8,7 +8,7 @@
 
 <p align="center">简体中文 | <a href="README_EN.md">English</a></p>
 
-VoiceTransl聆译是一站式离线AI视频字幕生成和翻译软件，支持Mac和Windows。从视频下载，音频提取，听写打轴，字幕翻译，视频合成，字幕总结各个环节为翻译者提供便利。本项目基于[Galtransl](https://github.com/xd2333/GalTransl)，采用GPLv3许可。
+VoiceTransl聆译是一站式离线AI视频字幕生成和翻译软件，支持Windows。从视频下载，音频提取，听写打轴，字幕翻译，视频合成，字幕总结各个环节为翻译者提供便利。本项目基于[Galtransl](https://github.com/xd2333/GalTransl)，采用GPLv3许可。
 
 ## 特色
 

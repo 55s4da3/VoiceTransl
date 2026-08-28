@@ -26,6 +26,8 @@ useful_tools/GalTransl_DumpInjector/VNTextPatch/names.xml
 # Models
 models/
 *.gguf
+_xxl_data
+crispasr
 
 # Tests are source-controlled; their runtime caches remain ignored above.
 separate
