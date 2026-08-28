@@ -14,6 +14,8 @@ on:
 env:
   LLAMA_CPP_VERSION: b10430
   CRISPASR_VERSION: v0.8.28
+  FFMPEG_VERSION: 9.0.1
+  FFMPEG_SHA256: fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9
 
 permissions:
   contents: write
@@ -68,6 +70,36 @@ jobs:
           python -m pip install --upgrade pip wheel setuptools
           python -m pip install pyinstaller
           python -m pip install -r ${{ matrix.requirements }}
+
+      - name: Download FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeRoot = Join-Path $env:RUNNER_TEMP 'voicetransl-native'
+          $ffmpegExtract = Join-Path $nativeRoot 'ffmpeg-extracted'
+          $ffmpegArchive = Join-Path $nativeRoot 'ffmpeg.zip'
+          New-Item -ItemType Directory -Force -Path $ffmpegExtract | Out-Null
+
+          $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$env:FFMPEG_VERSION-essentials_build.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegArchive
+          $actualHash = (Get-FileHash -LiteralPath $ffmpegArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:FFMPEG_SHA256) {
+            throw "FFmpeg archive checksum mismatch: expected $env:FFMPEG_SHA256, got $actualHash"
+          }
+          Expand-Archive -LiteralPath $ffmpegArchive -DestinationPath $ffmpegExtract -Force
+
+          $ffmpegExecutable = Get-ChildItem -LiteralPath $ffmpegExtract -Recurse -File -Filter 'ffmpeg.exe' | Select-Object -First 1
+          $ffprobeExecutable = Get-ChildItem -LiteralPath $ffmpegExtract -Recurse -File -Filter 'ffprobe.exe' | Select-Object -First 1
+          if (-not $ffmpegExecutable -or -not $ffprobeExecutable) {
+            throw 'ffmpeg.exe or ffprobe.exe was not found in the downloaded FFmpeg archive'
+          }
+
+          New-Item -ItemType Directory -Force -Path 'ffmpeg' | Out-Null
+          Copy-Item -LiteralPath $ffmpegExecutable.FullName -Destination 'ffmpeg/ffmpeg.exe' -Force
+          Copy-Item -LiteralPath $ffprobeExecutable.FullName -Destination 'ffmpeg/ffprobe.exe' -Force
+          & 'ffmpeg/ffmpeg.exe' -version
+          & 'ffmpeg/ffprobe.exe' -version
 
       - name: Download llama-server and CrispASR (Windows)
         if: runner.os == 'Windows'
@@ -150,7 +182,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $requiredFiles = 'translate.exe', 'separate.exe', 'llama-server.exe', 'crispasr.exe'
+          $requiredFiles = 'translate.exe', 'separate.exe', 'llama-server.exe', 'crispasr.exe', 'ffmpeg.exe', 'ffprobe.exe'
           if ('${{ matrix.llama_variant }}' -eq 'vulkan') {
             $requiredFiles += 'ggml-vulkan.dll'
           }
