@@ -27,8 +27,5 @@ whisper-faster/whisper-faster.exe
 # Faster Whisper XXL
 _xxl_data
 project/config.yaml
-# Tests
-Tests
-tests/
 separate/
 crispasr

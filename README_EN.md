@@ -12,7 +12,7 @@
 
 <p align="center"><a href="README.md">简体中文</a> | English</p>
 
-VoiceTransl is an all-in-one, offline AI application for generating and translating video subtitles on Windows and macOS. It provides a complete workflow for translators, including video downloading, audio extraction, transcription and timing, subtitle translation, video rendering, and subtitle summarization. This project is based on [GalTransl](https://github.com/xd2333/GalTransl) and is licensed under the GPLv3.
+VoiceTransl is an all-in-one, offline AI application for generating and translating video subtitles on Windows. It provides a complete workflow for translators, including video downloading, audio extraction, transcription and timing, subtitle translation, video rendering, and subtitle summarization. This project is based on [GalTransl](https://github.com/xd2333/GalTransl) and is licensed under the GPLv3.
 
 ## Features
 
