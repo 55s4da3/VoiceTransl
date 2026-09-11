@@ -15,6 +15,8 @@ from PySide6.QtCore import QObject, Signal, Slot
 import asrlabs_bridge
 import crispasr_bridge
 from core import (
+    _FFMPEG,
+    _FFPROBE,
     _SEPARATE_CMD,
     _load_api_key,
     ONLINE_TRANSLATOR_MAPPING,
@@ -808,12 +810,12 @@ class MainWorker(QObject):
                     if subtitle_font:
                         self._emit_status(_("status_synth_font", font=subtitle_font))
                     self._emit_status(_("status_synth_hard_sub"))
-                    proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-i', input_file, '-vf', subtitle_filter, '-vcodec', 'libx264', '-acodec', 'aac', output_file])
+                    proc = self._start_process([_FFMPEG, '-y', '-i', input_file, '-vf', subtitle_filter, '-vcodec', 'libx264', '-acodec', 'aac', output_file])
                 else:
                     self._emit_status(_("status_synth_soft_sub"))
                     # For soft subtitles, we just map the streams.
                     # Depending on the container and subtitle format, -c:s mov_text works for mp4.
-                    proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-i', input_file, '-i', input_srt, '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text', output_file])
+                    proc = self._start_process([_FFMPEG, '-y', '-i', input_file, '-i', input_srt, '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text', output_file])
 
                 return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
@@ -842,7 +844,7 @@ class MainWorker(QObject):
                 self._emit_status(_("status_processing_file", file=input_file, idx=idx+1, total=len(input_files)))
                 self._emit_status(_("status_clip_processing", start=clip_start, end=clip_end))
                 stage_id = self._begin_stage(_("progress_phase_clip"))
-                proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-i', input_file, '-ss', clip_start, '-to', clip_end, '-vcodec', 'libx264', '-acodec', 'aac', os.path.join(*(input_file.split('.')[:-1]))+'_clip.'+input_file.split('.')[-1]])
+                proc = self._start_process([_FFMPEG, '-y', '-i', input_file, '-ss', clip_start, '-to', clip_end, '-vcodec', 'libx264', '-acodec', 'aac', os.path.join(*(input_file.split('.')[:-1]))+'_clip.'+input_file.split('.')[-1]])
                 return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
                 if return_code != 0:
@@ -877,7 +879,7 @@ class MainWorker(QObject):
 
                 self._emit_status(_("status_processing_file", file=audio_input, idx=idx+1, total=len(image_files)))
                 stage_id = self._begin_stage(_("progress_phase_synth"))
-                proc = self._start_process(['ffmpeg/ffmpeg', '-y', '-loop', '1', '-r', '1', '-f', 'image2', '-i', image_input, '-i', audio_input, '-shortest', '-vcodec', 'libx264', '-acodec', 'aac', audio_input+'_synth.mp4'], label='ffmpeg')
+                proc = self._start_process([_FFMPEG, '-y', '-loop', '1', '-r', '1', '-f', 'image2', '-i', image_input, '-i', audio_input, '-shortest', '-vcodec', 'libx264', '-acodec', 'aac', audio_input+'_synth.mp4'], label='ffmpeg')
                 return_code = self._process_registry.wait(proc)
                 self._cleanup_process(proc)
                 if return_code != 0:
@@ -1187,7 +1189,7 @@ class MainWorker(QObject):
         """获取音频文件时长（秒）"""
         try:
             proc = self._process_registry.popen(
-                ['ffmpeg/ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                [_FFPROBE, '-v', 'error', '-show_entries', 'format=duration',
                  '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
@@ -1225,7 +1227,7 @@ class MainWorker(QObject):
             proc = None
             try:
                 proc = self._start_process(
-                    ['ffmpeg/ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                    [_FFMPEG, '-hide_banner', '-loglevel', 'error', '-y',
                      '-i', audio_file, '-ss', str(start_time),
                      '-t', str(duration), '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', segment_file],
                     label=f'ffmpeg_segment_{i + 1}',
@@ -1685,7 +1687,7 @@ class MainWorker(QObject):
                 audio_stage = self._begin_stage(_("progress_phase_audio"))
                 ffmpeg_proc, _unused = start_named_proc(
                     'ffmpeg_extract',
-                    ['ffmpeg/ffmpeg', '-y', '-i', input_file, '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', wav_file]
+                    [_FFMPEG, '-y', '-i', input_file, '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', wav_file]
                 )
                 self._process_registry.wait(ffmpeg_proc)
                 stop_named_proc('ffmpeg_extract')
