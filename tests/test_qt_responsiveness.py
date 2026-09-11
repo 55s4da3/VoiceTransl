@@ -69,13 +69,29 @@ class QtResponsivenessTests(unittest.TestCase):
             self.assertFalse(window.streaming_checkbox.isChecked())
 
             window.gpt_model.setText('deepseek-v4-flash')
-            for provider in ('Deepseek', 'OpenAI', 'Kimi'):
+            for provider in ('Deepseek', 'OpenAI', 'Kimi', 'OpenCode Go'):
                 self.assertGreaterEqual(
                     window.ai_resegment_provider_combo.findData(provider), 0
                 )
                 self.assertGreaterEqual(
                     window.proofread_provider_combo.findData(provider), 0
                 )
+            self.assertGreaterEqual(
+                window.translator_group.findText('OpenCode Go'), 0
+            )
+            window.gpt_model.clear()
+            window.translator_group.setCurrentText('OpenCode Go')
+            self.assertEqual(window.gpt_model.text(), 'deepseek-flash')
+            self.assertTrue(window.deepseek_thinking_checkbox.isEnabled())
+            window.gpt_model.setText('deepseek-v4-flash')
+            window._set_provider_value(
+                window.ai_resegment_provider_combo, 'OpenCode Go'
+            )
+            self.assertEqual(
+                window.ai_resegment_model_combo.currentText(),
+                'deepseek-flash',
+            )
+            self.assertTrue(window.ai_resegment_thinking_checkbox.isEnabled())
             window._set_provider_value(
                 window.ai_resegment_provider_combo, 'Deepseek'
             )

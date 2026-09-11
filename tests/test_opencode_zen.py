@@ -5,8 +5,11 @@ from unittest.mock import MagicMock, patch
 from GalTransl.COpenAI import COpenAIToken, COpenAITokenPool
 
 from opencode_zen import (
+    OPENCODE_GO_ENDPOINT,
+    OPENCODE_GO_PROVIDER,
     OPENCODE_ZEN_ENDPOINT,
     filter_supported_opencode_models,
+    is_deepseek_v4_family,
     is_opencode_zen_endpoint,
     opencode_zen_api_mode,
     responses_finish_reason,
@@ -21,7 +24,19 @@ class OpenCodeZenTests(unittest.TestCase):
         self.assertTrue(is_opencode_zen_endpoint(OPENCODE_ZEN_ENDPOINT))
         self.assertTrue(is_opencode_zen_endpoint("https://opencode.ai/zen/v1"))
         self.assertTrue(is_opencode_zen_endpoint("https://opencode.ai/zen/go/v1"))
+        self.assertTrue(is_opencode_zen_endpoint(OPENCODE_GO_ENDPOINT))
         self.assertFalse(is_opencode_zen_endpoint("https://api.openai.com/v1"))
+
+    def test_go_deepseek_v41_alias(self):
+        self.assertEqual(OPENCODE_GO_PROVIDER, "OpenCode Go")
+        self.assertEqual(OPENCODE_GO_ENDPOINT, "https://opencode.ai/zen/go")
+        self.assertTrue(is_deepseek_v4_family("deepseek-flash"))
+        self.assertTrue(is_deepseek_v4_family("deepseek-v4-flash"))
+        self.assertFalse(is_deepseek_v4_family("deepseek-chat"))
+        self.assertEqual(
+            opencode_zen_api_mode(OPENCODE_GO_ENDPOINT, "deepseek-flash"),
+            "chat",
+        )
 
     def test_model_protocol_routing(self):
         endpoint = "https://opencode.ai/zen/v1"

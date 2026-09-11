@@ -26,6 +26,7 @@ from contextlib import suppress
 from GalTransl.TerminalOutput import should_print_translation_logs
 from output_metrics import encode_output_event
 from opencode_zen import (
+    is_deepseek_v4_family,
     opencode_zen_api_mode,
     responses_finish_reason,
     responses_output_text,
@@ -768,7 +769,7 @@ class BaseTranslate:
                 # 不支持 thinking 字段的其他 OpenAI 兼容服务。
                 if active_thinking_mode != "auto":
                     model_lower = request_model.lower()
-                    if model_lower.startswith("deepseek-v4"):
+                    if is_deepseek_v4_family(model_lower):
                         request_kwargs["extra_body"] = {
                             "thinking": {"type": active_thinking_mode}
                         }

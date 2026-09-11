@@ -20,7 +20,13 @@ if not _FROZEN:
         _STREAMING_PRELOAD_ERROR = _streaming_preload_exc
 import shutil
 import shlex
-from opencode_zen import OPENCODE_ZEN_ENDPOINT, OPENCODE_ZEN_PROVIDER
+from opencode_zen import (
+    OPENCODE_GO_ENDPOINT,
+    OPENCODE_GO_PROVIDER,
+    OPENCODE_ZEN_ENDPOINT,
+    OPENCODE_ZEN_PROVIDER,
+    is_deepseek_v4_family,
+)
 
 NO_TRANSCRIPTION = '不进行听写'
 NO_TRANSLATION = '不进行翻译'
@@ -77,6 +83,7 @@ ONLINE_TRANSLATOR_MAPPING = {
     'Gemini': 'https://generativelanguage.googleapis.com/v1beta/openai',
     'OpenAI': 'https://api.openai.com',
     OPENCODE_ZEN_PROVIDER: OPENCODE_ZEN_ENDPOINT,
+    OPENCODE_GO_PROVIDER: OPENCODE_GO_ENDPOINT,
     'Ollama': 'http://localhost:11434',
     "llamacpp（通用本地模型）": "http://localhost:8989",
 }
@@ -87,8 +94,8 @@ def model_supports_thinking(model_name: str) -> bool:
     name = str(model_name or '').strip().lower()
     if not name:
         return False
-    if any(marker in name for marker in (
-        'deepseek-v4', 'deepseek-reasoner', 'reasoning', 'thinking',
+    if is_deepseek_v4_family(name) or any(marker in name for marker in (
+        'deepseek-reasoner', 'reasoning', 'thinking',
         'qwq', 'qwen3',
     )):
         return True

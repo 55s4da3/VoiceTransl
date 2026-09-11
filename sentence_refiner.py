@@ -13,7 +13,7 @@ from typing import Callable
 import httpx
 
 from GalTransl.ConfigHelper import build_httpx_sync_proxy_kwargs
-from opencode_zen import opencode_zen_api_mode
+from opencode_zen import is_deepseek_v4_family, opencode_zen_api_mode
 from tasking import CancellationToken, TaskCancelledError
 
 
@@ -382,7 +382,7 @@ def request_openai_compatible(
         )
     output_limit = max(1, min(
         int(max_output_tokens),
-        384000 if model.lower().startswith("deepseek-v4") else 65536,
+        384000 if is_deepseek_v4_family(model) else 65536,
     ))
     if api_mode == "responses":
         payload = {
@@ -400,7 +400,7 @@ def request_openai_compatible(
             "max_tokens": output_limit,
         }
     model_lower = model.lower()
-    if api_mode == "chat" and model_lower.startswith("deepseek-v4"):
+    if api_mode == "chat" and is_deepseek_v4_family(model_lower):
         payload["thinking"] = {
             "type": "enabled" if thinking_enabled else "disabled"
         }

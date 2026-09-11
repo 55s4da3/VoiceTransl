@@ -279,6 +279,47 @@ class SentenceRefinerTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_opencode_go_v41_uses_deepseek_limits_and_thinking(self):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["path"] = self.path
+                length = int(self.headers.get("content-length", "0"))
+                seen["body"] = json.loads(self.rfile.read(length))
+                payload = json.dumps({
+                    "choices": [{"delta": {"content": "done"}}]
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: " + payload + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = request_openai_compatible(
+                "prompt",
+                endpoint=f"http://127.0.0.1:{server.server_port}",
+                model="deepseek-flash",
+                api_key="test-token",
+                cancel_token=CancellationToken(),
+                thinking_enabled=True,
+                max_output_tokens=500000,
+            )
+            self.assertEqual(result, "done")
+            self.assertEqual(seen["path"], "/v1/chat/completions")
+            self.assertEqual(seen["body"]["max_tokens"], 384000)
+            self.assertEqual(seen["body"]["thinking"], {"type": "enabled"})
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_streaming_opencode_responses_request(self):
         seen = {}
 

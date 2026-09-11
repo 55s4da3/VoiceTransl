@@ -205,6 +205,55 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(kwargs["input"], [{"role": "user", "content": "source"}])
         self.assertEqual(kwargs["max_output_tokens"], 2048)
 
+    def test_opencode_go_v41_translation_enables_deepseek_thinking(self):
+        chat_create = AsyncMock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="translated text"),
+                finish_reason="stop",
+            )],
+        ))
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=chat_create),
+            ),
+        )
+        token = SimpleNamespace(
+            domain="https://opencode.ai/zen/go/v1",
+            model_name="deepseek-flash",
+            stream=False,
+            maskToken=lambda: "test-token",
+        )
+        translator = BaseTranslate.__new__(BaseTranslate)
+        translator.client_list = [(fake_client, token)]
+        translator.proofread_client_list = []
+        translator.thinking_mode = "enabled"
+        translator.proofread_thinking_mode = "auto"
+        translator.tokenStrategy = "random"
+        translator.api_timeout = 10
+        translator.apiErrorWait = 0
+        translator.global_request_rpm = 0
+        translator.request_health_metrics = SimpleNamespace(record=lambda *_args: None)
+        translator.pj_config = SimpleNamespace(
+            stop_event=threading.Event(),
+            active_workers=2,
+            bar=SimpleNamespace(text=lambda *_args: None),
+        )
+
+        result, used_token = asyncio.run(translator.ask_chatbot(
+            prompt="source",
+            system="translate",
+            stream=False,
+            max_tokens=2048,
+        ))
+
+        self.assertEqual(result, "translated text")
+        self.assertIs(used_token, token)
+        kwargs = chat_create.await_args.kwargs
+        self.assertEqual(kwargs["model"], "deepseek-flash")
+        self.assertEqual(
+            kwargs["extra_body"]["thinking"], {"type": "enabled"}
+        )
+
     def test_translation_config_writes_independent_proofread_profile(self):
         snapshot = TaskSnapshot('run', {
             'translator': 'OpenAI',
@@ -242,6 +291,39 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(backend['proofreadToken'], 'proofread-key')
         self.assertEqual(backend['thinkingMode'], 'disabled')
         self.assertEqual(backend['proofreadThinkingMode'], 'enabled')
+
+    def test_opencode_go_provider_writes_v41_endpoint_and_model(self):
+        snapshot = TaskSnapshot('run', {
+            'translator': 'OpenCode Go',
+            'language': 'ja',
+            'target_lang': 'zh-cn',
+            'gpt_model': 'deepseek-flash',
+            'gpt_token': 'go-key',
+            'deepseek_thinking': True,
+        })
+        worker = MainWorker(
+            snapshot,
+            SimpleNamespace(put=lambda *_args: None),
+            CancellationToken(),
+        )
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                worker.update_translation_config()
+                import yaml
+                with open('project/config.yaml', 'r', encoding='utf-8') as stream:
+                    config = yaml.safe_load(stream)
+            finally:
+                os.chdir(original_cwd)
+
+        backend = config['backendSpecific']['OpenAI-Compatible']
+        self.assertEqual(
+            backend['tokens'][0]['endpoint'],
+            'https://opencode.ai/zen/go',
+        )
+        self.assertEqual(backend['tokens'][0]['modelName'], 'deepseek-flash')
+        self.assertEqual(backend['thinkingMode'], 'enabled')
 
     def test_worker_uses_snapshot_and_finishes_once(self):
         token = CancellationToken()

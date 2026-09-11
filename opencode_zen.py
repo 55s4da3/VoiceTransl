@@ -13,9 +13,21 @@ from urllib.parse import urlparse
 
 OPENCODE_ZEN_PROVIDER = "OpenCode Zen"
 OPENCODE_ZEN_ENDPOINT = "https://opencode.ai/zen"
+OPENCODE_GO_PROVIDER = "OpenCode Go"
+OPENCODE_GO_ENDPOINT = "https://opencode.ai/zen/go"
 
 _RESPONSES_MODEL_PREFIXES = ("gpt-", "grok-", "muse-spark-")
 _UNSUPPORTED_MODEL_PREFIXES = ("claude-", "gemini-", "qwen")
+
+
+def is_deepseek_v4_family(model: str) -> bool:
+    """Recognize official V4 IDs and OpenCode Go's V4.1 alias."""
+    model_id = str(model or "").strip().lower()
+    return (
+        model_id.startswith("deepseek-v4")
+        or model_id == "deepseek-flash"
+        or model_id.endswith("/deepseek-flash")
+    )
 
 
 def is_opencode_zen_endpoint(endpoint: str) -> bool:

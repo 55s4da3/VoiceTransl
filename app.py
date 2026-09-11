@@ -10,6 +10,7 @@ from pathlib import Path
 
 import asrlabs_bridge
 import crispasr_bridge
+from opencode_zen import OPENCODE_GO_PROVIDER
 
 from core import (
     DEFAULT_CRISPASR_BACKEND,
@@ -1993,6 +1994,8 @@ class MainWindow(QMainWindow):
 
         if provider == 'Deepseek':
             choices = ['deepseek-v4-flash', 'deepseek-v4-pro']
+        elif provider == OPENCODE_GO_PROVIDER:
+            choices = ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash']
         else:
             choices = []
         choices.extend(
@@ -2010,6 +2013,8 @@ class MainWindow(QMainWindow):
             model_combo.setEditText(saved_value)
         elif provider == 'Deepseek':
             model_combo.setCurrentText('deepseek-v4-flash')
+        elif provider == OPENCODE_GO_PROVIDER:
+            model_combo.setCurrentText('deepseek-flash')
         else:
             model_combo.setEditText('')
         model_combo.blockSignals(False)
@@ -2050,6 +2055,12 @@ class MainWindow(QMainWindow):
             checkbox.setEnabled(model_supports_thinking(model_name))
             if not checkbox.isEnabled():
                 checkbox.setChecked(False)
+
+    def _on_main_translator_changed(self, _index=None):
+        provider = self.translator_group.currentText()
+        if provider == OPENCODE_GO_PROVIDER and not self.gpt_model.text().strip():
+            self.gpt_model.setText('deepseek-flash')
+        self._update_thinking_availability()
 
     def _update_translator_mode(self, _index=None, preferred: str = ''):
         """Filter translator choices without losing a compatible selection."""
@@ -3784,7 +3795,7 @@ class MainWindow(QMainWindow):
         self.deepseek_thinking_checkbox.setToolTip(_("tip_deepseek_thinking"))
         self.gpt_model.textChanged.connect(lambda _text: self._update_thinking_availability())
         self.translator_group.currentIndexChanged.connect(
-            lambda _index: self._update_thinking_availability()
+            self._on_main_translator_changed
         )
         self.translator_mode.currentIndexChanged.connect(
             self._update_translator_mode
