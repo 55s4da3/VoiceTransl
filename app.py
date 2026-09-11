@@ -3437,6 +3437,10 @@ class MainWindow(QMainWindow):
         self.refresh_speech_models_button = QPushButton(_("settings_refresh_speech_btn"))
         self.refresh_speech_models_button.clicked.connect(self.refresh_speech_model_lists)
         button_layout.addWidget(self.refresh_speech_models_button)
+
+        self.test_offline_asr_button = QPushButton(_("settings_test_offline_asr_btn"))
+        self.test_offline_asr_button.clicked.connect(self.run_test_offline_asr)
+        button_layout.addWidget(self.test_offline_asr_button)
         self.settings_layout.addLayout(button_layout)
 
         self._crispasr_discovery_done = False
@@ -3631,6 +3635,12 @@ class MainWindow(QMainWindow):
         self.refresh_language_models_button = QPushButton(_("adv_refresh_model_btn"))
         self.refresh_language_models_button.clicked.connect(self.refresh_language_model_lists)
         button_layout.addWidget(self.refresh_language_models_button)
+
+        self.test_offline_translation_button = QPushButton(_("adv_test_offline_btn"))
+        self.test_offline_translation_button.clicked.connect(
+            self.run_test_offline_translation
+        )
+        button_layout.addWidget(self.test_offline_translation_button)
 
         self.test_online_button = QPushButton(_("adv_test_api_btn"))
         self.test_online_button.clicked.connect(self.run_test_online_api)
@@ -3911,6 +3921,16 @@ class MainWindow(QMainWindow):
         self._start_worker_task(
             'test_online_api', _("task_api_test"),
             show_model_dialog=True,
+        )
+
+    def run_test_offline_asr(self):
+        self._start_worker_task(
+            'test_offline_asr', _("settings_test_offline_asr_btn")
+        )
+
+    def run_test_offline_translation(self):
+        self._start_worker_task(
+            'test_offline_translation', _("adv_test_offline_btn")
         )
 
     def run_test_auxiliary_api(self, prefix: str):

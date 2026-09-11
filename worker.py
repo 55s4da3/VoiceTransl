@@ -2,10 +2,12 @@ import os
 import json
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
+from time import monotonic
 
 import requests
 import httpx
@@ -18,13 +20,18 @@ from core import (
     _FFMPEG,
     _FFPROBE,
     _SEPARATE_CMD,
+    _format_command,
     _load_api_key,
     ONLINE_TRANSLATOR_MAPPING,
     model_supports_thinking,
 )
 from i18n import _
 from log import _stream_proc_to_queue
-from pool import ConcurrentTranslationPool, TranscribedFile
+from pool import (
+    ConcurrentTranslationPool,
+    TranscribedFile,
+    build_llama_server_command,
+)
 from tasking import (
     CancellationToken,
     ProcessRegistry,
@@ -48,6 +55,24 @@ from bilibili_dl.bilibili_dl.utils import send_request
 from bilibili_dl.bilibili_dl.constants import URL_VIDEO_INFO
 
 CRISPASR_DIR = crispasr_bridge.DEFAULT_CRISPASR_DIR
+
+
+def _find_available_local_port() -> int:
+    """Choose an unused loopback port for a short-lived model self-test."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        return int(sock.getsockname()[1])
+
+
+def _offline_asr_test_audio(language) -> Path:
+    """Return the bundled speech sample matching the selected language."""
+    language_code = str(language or 'ja').lower()
+    if language_code.startswith('zh'):
+        language_code = 'zh'
+    sample = Path('assets') / 'offline_model_test' / f'{language_code}.mp3'
+    if not sample.is_file():
+        sample = Path('assets') / 'offline_model_test' / 'en.mp3'
+    return sample.resolve()
 
 def error_handler(func):
     def wrapper(self):
@@ -665,6 +690,148 @@ class MainWorker(QObject):
             self._finish_stage(stage_id)
         except Exception as e:
             self._emit_status(_("status_api_error", error=e))
+
+    @error_handler
+    def test_offline_asr(self):
+        """Load the selected CrispASR models and transcribe a bundled sample."""
+        self._stop_requested = False
+        self._emit_file_progress(0, 0, visible=False)
+        started_at = monotonic()
+        proc = None
+        try:
+            asr_config = dict(self._task_asr_config)
+            if asr_config.get('provider') != 'crispasr':
+                raise ValueError(_("offline_test_requires_crispasr"))
+            language = self.config.get('language', 'ja')
+            audio_file = _offline_asr_test_audio(language)
+            if not audio_file.is_file():
+                raise FileNotFoundError(_("offline_test_audio_missing"))
+
+            model_file = str(asr_config.get('crispasr_model', '')).strip()
+            aligner_file = str(asr_config.get('crispasr_aligner', '')).strip()
+            backend = str(asr_config.get('crispasr_backend', '')).strip()
+            command_template = str(asr_config.get('crispasr_param', '')).strip()
+            if not model_file:
+                raise ValueError(_("offline_test_asr_model_missing"))
+            if not aligner_file:
+                raise ValueError(_("offline_test_aligner_missing"))
+
+            self._emit_status(_(
+                "status_offline_asr_test_starting", model=model_file
+            ))
+            with tempfile.TemporaryDirectory(prefix='voicetransl_asr_test_') as temp_dir:
+                output_base = Path(temp_dir) / 'transcript'
+                command = crispasr_bridge.build_command(
+                    audio_file,
+                    output_base,
+                    model_file,
+                    language,
+                    command_template,
+                    aligner_file=aligner_file,
+                    backend=backend,
+                )
+                self.msg_queue.put("detail", _format_command(command))
+                proc = self._start_process(command, label='CrispASR test')
+                try:
+                    return_code = self._process_registry.wait(proc, timeout=300)
+                except subprocess.TimeoutExpired as exc:
+                    raise TimeoutError(_("offline_test_asr_timeout")) from exc
+                self._raise_if_cancelled()
+                if return_code != 0:
+                    raise RuntimeError(f'CrispASR exited with code {return_code}')
+                result_file = output_base.with_suffix('.srt')
+                if not result_file.is_file() or result_file.stat().st_size == 0:
+                    raise RuntimeError(_("offline_test_asr_no_output"))
+
+            self._emit_status(_(
+                "status_offline_asr_test_success",
+                seconds=monotonic() - started_at,
+            ))
+        except TaskCancelledError:
+            raise
+        except Exception as exc:
+            self._task_outcome = "error"
+            self._emit_status(_("status_offline_asr_test_failed", error=exc))
+        finally:
+            if proc is not None:
+                self._cleanup_process(proc)
+
+    @error_handler
+    def test_offline_translation(self):
+        """Start the selected llama-server model and perform one local request."""
+        self._stop_requested = False
+        self._emit_file_progress(0, 0, visible=False)
+        started_at = monotonic()
+        proc = None
+        try:
+            model_file = str(self.config.get('sakura_file', '')).strip()
+            gpu_layers = str(self.config.get('sakura_mode', '')).strip()
+            command_template = str(self.config.get('param_llama', '')).strip()
+            if not model_file:
+                raise ValueError(_("offline_test_translation_model_missing"))
+
+            port = _find_available_local_port()
+            command = build_llama_server_command(
+                model_file, gpu_layers, command_template, port
+            )
+            self._emit_status(_(
+                "status_offline_translation_test_starting", model=model_file
+            ))
+            self.msg_queue.put("detail", _format_command(command))
+            proc = self._start_process(command, label='llama-server test')
+
+            session = requests.Session()
+            session.trust_env = False
+            deadline = monotonic() + 180
+            last_error = ''
+            while monotonic() < deadline:
+                self._raise_if_cancelled()
+                return_code = proc.poll()
+                if return_code is not None:
+                    raise RuntimeError(f'llama-server exited with code {return_code}')
+                try:
+                    response = session.post(
+                        f'http://127.0.0.1:{port}/v1/chat/completions',
+                        json={
+                            'model': Path(model_file).name,
+                            'messages': [{
+                                'role': 'user',
+                                'content': 'Reply with only: OK',
+                            }],
+                            'max_tokens': 8,
+                            'temperature': 0,
+                        },
+                        timeout=8,
+                    )
+                    if response.status_code == 200:
+                        payload = response.json()
+                        if isinstance(payload, dict) and payload.get('choices'):
+                            self._emit_status(_(
+                                "status_offline_translation_test_success",
+                                seconds=monotonic() - started_at,
+                            ))
+                            return
+                    last_error = f'HTTP {response.status_code}: {response.text[:200]}'
+                except requests.RequestException as exc:
+                    last_error = str(exc)
+                except ValueError as exc:
+                    last_error = str(exc)
+                self.cancel_token.event.wait(1)
+
+            detail = last_error or _("offline_test_no_response")
+            raise TimeoutError(_(
+                "offline_test_translation_timeout", detail=detail
+            ))
+        except TaskCancelledError:
+            raise
+        except Exception as exc:
+            self._task_outcome = "error"
+            self._emit_status(_(
+                "status_offline_translation_test_failed", error=exc
+            ))
+        finally:
+            if proc is not None:
+                self._cleanup_process(proc)
 
     @error_handler
     def vocal_split(self):

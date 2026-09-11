@@ -30,6 +30,8 @@ class QtResponsivenessTests(unittest.TestCase):
                 window.top_tabs.tabText(5), app._("tab_phone")
             )
             self.assertTrue(hasattr(window, "media_library_scan_button"))
+            self.assertTrue(window.test_offline_asr_button.isEnabled())
+            self.assertTrue(window.test_offline_translation_button.isEnabled())
             window.streaming_checkbox.setEnabled(True)
             window.streaming_checkbox.setChecked(True)
             window.ai_resegment_checkbox.setChecked(True)
