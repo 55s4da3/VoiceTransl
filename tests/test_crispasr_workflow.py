@@ -9,12 +9,14 @@ from pathlib import Path
 
 _ORIGINAL_STDOUT = sys.stdout
 _ORIGINAL_STDERR = sys.stderr
-from app import (
+from core import (
     NO_TRANSCRIPTION,
     NO_TRANSLATION,
     TRANSLATOR_SUPPORTED,
-    _build_crispasr_command,
     _compose_output_format,
+)
+from asr import (
+    _build_crispasr_command,
     _list_crispasr_aligners,
     _list_crispasr_backends,
     _list_crispasr_models,
@@ -51,15 +53,18 @@ class CrispASRWorkflowTest(unittest.TestCase):
 
     def test_default_arguments_keep_alignment_without_strict_failure(self):
         parameter_template = PARAM_FILE.read_text(encoding="utf-8").strip()
-        command = _build_crispasr_command(
-            ROOT / "input.wav",
-            ROOT / "transcript",
-            MODEL_FILE,
-            "ja",
-            parameter_template,
-            aligner_file=ALIGNER_FILE,
-            backend="qwen3-1.7b",
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_file = Path(temp_dir) / "input.wav"
+            input_file.touch()
+            command = _build_crispasr_command(
+                input_file,
+                Path(temp_dir) / "transcript",
+                MODEL_FILE,
+                "ja",
+                parameter_template,
+                aligner_file=ALIGNER_FILE,
+                backend="qwen3-1.7b",
+            )
         self.assertIn("--force-aligner", command)
         self.assertNotIn("--strict-pipeline", command)
         self.assertNotIn("--require-word-timestamps", command)
@@ -68,17 +73,20 @@ class CrispASRWorkflowTest(unittest.TestCase):
         self.assertEqual(command[command.index("--backend") + 1], "qwen3-1.7b")
 
     def test_selected_backend_overrides_a_legacy_hardcoded_template(self):
-        command = _build_crispasr_command(
-            ROOT / "input.wav",
-            ROOT / "transcript",
-            MODEL_FILE,
-            "ja",
-            "$crispasr_executable --backend whisper --model $model_file "
-            "--aligner-model $aligner_file --output-srt --output-file $output_file "
-            "--file $input_file",
-            aligner_file=ALIGNER_FILE,
-            backend="qwen3-1.7b",
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_file = Path(temp_dir) / "input.wav"
+            input_file.touch()
+            command = _build_crispasr_command(
+                input_file,
+                Path(temp_dir) / "transcript",
+                MODEL_FILE,
+                "ja",
+                "$crispasr_executable --backend whisper --model $model_file "
+                "--aligner-model $aligner_file --output-srt --output-file $output_file "
+                "--file $input_file",
+                aligner_file=ALIGNER_FILE,
+                backend="qwen3-1.7b",
+            )
         self.assertEqual(command[command.index("--backend") + 1], "qwen3-1.7b")
 
     @unittest.skipUnless(

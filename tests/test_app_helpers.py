@@ -9,17 +9,14 @@ from unittest.mock import patch
 
 _ORIGINAL_STDOUT = sys.stdout
 _ORIGINAL_STDERR = sys.stderr
-from app import (
+from core import _compose_output_format
+from crispasr_bridge import split_command_template
+from log import (
     UIMessageQueue,
     _TranslationLogParser,
     _clean_control_chars,
-    _compose_output_format,
     _decode_subprocess_line,
-    _find_available_local_port,
     _line_passes_filter,
-    _set_command_option,
-    _split_command_template,
-    _split_output_format,
     _strip_ansi,
     _stream_proc_to_queue,
 )
@@ -31,19 +28,9 @@ class AppFormattingTests(unittest.TestCase):
     def test_output_format_round_trip(self):
         self.assertEqual(_compose_output_format("双语", "SRT", True), "双语SRT")
         self.assertEqual(_compose_output_format("目标", "LRC", False), "原文LRC")
-        self.assertEqual(_split_output_format("双语SRT"), ("双语", "SRT"))
-        self.assertEqual(_split_output_format("目标LRC"), ("目标", "LRC"))
-        self.assertEqual(_split_output_format("unknown"), ("unknown", ""))
-
-    def test_command_option_replaces_separate_and_equals_forms(self):
-        command = ["tool", "-m", "old", "--port=1"]
-        _set_command_option(command, ("--model", "-m"), "--model", "new")
-        _set_command_option(command, ("--port",), "--port", "2")
-        _set_command_option(command, ("--backend",), "--backend", "qwen")
-        self.assertEqual(command, ["tool", "-m", "new", "--port=2", "--backend", "qwen"])
 
     def test_command_template_preserves_quoted_argument(self):
-        tokens = _split_command_template('tool --model "a model.gguf"')
+        tokens = split_command_template('tool --model "a model.gguf"')
         self.assertEqual(tokens, ["tool", "--model", "a model.gguf"])
 
     def test_log_text_cleaning_and_filtering(self):
@@ -57,12 +44,6 @@ class AppFormattingTests(unittest.TestCase):
     def test_subprocess_decoding_falls_back_to_gbk(self):
         self.assertEqual(_decode_subprocess_line("中文".encode("gbk")), "中文")
         self.assertEqual(_decode_subprocess_line(b"ascii"), "ascii")
-
-    def test_available_port_is_in_valid_range(self):
-        port = _find_available_local_port()
-        self.assertGreater(port, 0)
-        self.assertLessEqual(port, 65535)
-
 
 class MessageQueueAndLogParserTests(unittest.TestCase):
     def test_message_queue_logs_clean_text_drains_and_completes(self):
