@@ -16,7 +16,9 @@ from core import (
     LOG_PATH,
     NO_TRANSCRIPTION,
     NO_TRANSLATION,
+    LOCAL_TRANSLATOR_SUPPORTED,
     ONLINE_TRANSLATOR_MAPPING,
+    ONLINE_TRANSLATOR_SUPPORTED,
     model_supports_thinking,
     TRANSLATOR_SUPPORTED,
     _compose_output_format,
@@ -2049,6 +2051,22 @@ class MainWindow(QMainWindow):
             if not checkbox.isEnabled():
                 checkbox.setChecked(False)
 
+    def _update_translator_mode(self, _index=None, preferred: str = ''):
+        """Filter translator choices without losing a compatible selection."""
+        mode = self.translator_mode.currentData() or 'online'
+        choices = (
+            LOCAL_TRANSLATOR_SUPPORTED
+            if mode == 'local' else ONLINE_TRANSLATOR_SUPPORTED
+        )
+        selected = preferred or self.translator_group.currentText()
+        self.translator_group.blockSignals(True)
+        self.translator_group.clear()
+        self.translator_group.addItems(choices)
+        if selected in choices:
+            self.translator_group.setCurrentText(selected)
+        self.translator_group.blockSignals(False)
+        self._update_thinking_availability()
+
     @staticmethod
     def _set_provider_value(combo: QComboBox, provider: str):
         index = combo.findData(provider or 'follow')
@@ -2176,6 +2194,14 @@ class MainWindow(QMainWindow):
                     combo.setCurrentIndex(index)
             saved_translator = gui_settings.get('translator', '')
             legacy_translation_disabled = saved_translator == NO_TRANSLATION
+            saved_mode = (
+                'local'
+                if saved_translator in LOCAL_TRANSLATOR_SUPPORTED else 'online'
+            )
+            mode_index = self.translator_mode.findData(saved_mode)
+            if mode_index >= 0:
+                self.translator_mode.setCurrentIndex(mode_index)
+            self._update_translator_mode(preferred=saved_translator)
             if (
                 saved_translator
                 and not legacy_translation_disabled
@@ -3464,8 +3490,16 @@ class MainWindow(QMainWindow):
         model_row = QHBoxLayout()
         self.adv_translator_label = BodyLabel(_("adv_translator_label"))
         model_row.addWidget(self.adv_translator_label)
+        self.translator_mode = QComboBox()
+        self.translator_mode.addItem(
+            _("adv_translator_mode_online"), userData='online'
+        )
+        self.translator_mode.addItem(
+            _("adv_translator_mode_local"), userData='local'
+        )
+        model_row.addWidget(self.translator_mode)
         self.translator_group = QComboBox()
-        self.translator_group.addItems(TRANSLATOR_SUPPORTED)
+        self.translator_group.addItems(ONLINE_TRANSLATOR_SUPPORTED)
         model_row.addWidget(self.translator_group)
         model_row.addSpacing(20)
         self.adv_concurrency_label = BodyLabel(_("adv_concurrency_label"))
@@ -3598,6 +3632,9 @@ class MainWindow(QMainWindow):
         self.gpt_model.textChanged.connect(lambda _text: self._update_thinking_availability())
         self.translator_group.currentIndexChanged.connect(
             lambda _index: self._update_thinking_availability()
+        )
+        self.translator_mode.currentIndexChanged.connect(
+            self._update_translator_mode
         )
         self.advanced_settings_layout.addWidget(self.deepseek_thinking_checkbox)
 

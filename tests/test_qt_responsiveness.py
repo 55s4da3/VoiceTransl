@@ -32,6 +32,21 @@ class QtResponsivenessTests(unittest.TestCase):
             self.assertTrue(hasattr(window, "media_library_scan_button"))
             self.assertTrue(window.test_offline_asr_button.isEnabled())
             self.assertTrue(window.test_offline_translation_button.isEnabled())
+            self.assertEqual(window.translator_mode.currentData(), "online")
+            self.assertNotIn(
+                "sakura（日语本地模型）",
+                [window.translator_group.itemText(i) for i in range(window.translator_group.count())],
+            )
+            window.translator_mode.setCurrentIndex(
+                window.translator_mode.findData("local")
+            )
+            self.assertIn(
+                "sakura（日语本地模型）",
+                [window.translator_group.itemText(i) for i in range(window.translator_group.count())],
+            )
+            window.translator_mode.setCurrentIndex(
+                window.translator_mode.findData("online")
+            )
             window.streaming_checkbox.setEnabled(True)
             window.streaming_checkbox.setChecked(True)
             window.ai_resegment_checkbox.setChecked(True)

@@ -99,6 +99,15 @@ TRANSLATOR_SUPPORTED = [
     "sakura（日语本地模型）",
 ] + list(ONLINE_TRANSLATOR_MAPPING.keys())
 
+LOCAL_TRANSLATOR_SUPPORTED = [
+    translator for translator in TRANSLATOR_SUPPORTED
+    if 'sakura' in translator or 'llamacpp' in translator
+]
+ONLINE_TRANSLATOR_SUPPORTED = [
+    translator for translator in TRANSLATOR_SUPPORTED
+    if translator not in LOCAL_TRANSLATOR_SUPPORTED
+]
+
 
 # .env API Key 读写辅助函数
 def _load_api_key(variable_name: str = 'VOICETRANSL_API_KEY') -> str:
