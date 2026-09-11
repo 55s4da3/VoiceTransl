@@ -20,6 +20,7 @@ from log import (
     _strip_ansi,
     _stream_proc_to_queue,
 )
+from pool import _set_command_option, build_llama_server_command
 sys.stdout = _ORIGINAL_STDOUT
 sys.stderr = _ORIGINAL_STDERR
 
@@ -32,6 +33,31 @@ class AppFormattingTests(unittest.TestCase):
     def test_command_template_preserves_quoted_argument(self):
         tokens = split_command_template('tool --model "a model.gguf"')
         self.assertEqual(tokens, ["tool", "--model", "a model.gguf"])
+
+    def test_command_option_replaces_separate_and_equals_forms(self):
+        command = ["tool", "-m", "old", "--port=1"]
+        _set_command_option(command, ("--model", "-m"), "--model", "new")
+        _set_command_option(command, ("--port",), "--port", "2")
+        _set_command_option(command, ("--backend",), "--backend", "qwen")
+        self.assertEqual(command, ["tool", "-m", "new", "--port=2", "--backend", "qwen"])
+
+    def test_llama_command_uses_validated_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model = root / "model.gguf"
+            executable = root / ("llama-server.exe" if os.name == "nt" else "llama-server")
+            model.touch()
+            executable.touch()
+            command = build_llama_server_command(
+                model,
+                "42",
+                f'"{executable}" --model old --port=1',
+                9123,
+            )
+        self.assertEqual(Path(command[0]), executable.resolve())
+        self.assertEqual(command[command.index("--model") + 1], str(model.resolve()))
+        self.assertIn("--port=9123", command)
+        self.assertEqual(command[command.index("--n-gpu-layers") + 1], "42")
 
     def test_log_text_cleaning_and_filtering(self):
         self.assertEqual(_strip_ansi("\x1b[31merror\x1b[0m"), "error")

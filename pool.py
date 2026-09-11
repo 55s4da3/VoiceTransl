@@ -2,6 +2,7 @@ import os
 import re
 import json
 import queue
+import shlex
 import shutil
 import subprocess
 import threading
@@ -26,6 +27,86 @@ from prompt2srt import make_lrc, make_srt, merge_lrc_files
 from srt2prompt import merge_srt_files
 from tasking import CancellationToken, ProcessRegistry, TaskCancelledError
 from output_metrics import decode_output_event
+
+
+def _split_command_template(value: str) -> list[str]:
+    """Split a subprocess template without invoking a shell."""
+    if os.name != 'nt':
+        return shlex.split(value)
+    tokens = shlex.split(value, posix=False)
+    return [
+        token[1:-1]
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
+        else token
+        for token in tokens
+    ]
+
+
+def _set_command_option(command, option_names, preferred_option, value):
+    """Set a split command option, appending it when absent."""
+    for index, token in enumerate(command):
+        if token in option_names:
+            if index + 1 < len(command):
+                command[index + 1] = value
+            else:
+                command.append(value)
+            return
+        for option_name in option_names:
+            if token.startswith(option_name + '='):
+                command[index] = f'{preferred_option}={value}'
+                return
+    command.extend([preferred_option, value])
+
+
+def build_llama_server_command(model_file, gpu_layers, param_llama, port):
+    """Build a validated llama-server command for normal runs and self-tests."""
+    llama_dir = Path('llama').resolve()
+    model_path = Path(model_file)
+    if not model_path.is_absolute():
+        model_path = llama_dir / model_path
+    model_path = model_path.resolve()
+    if not model_path.is_file():
+        raise FileNotFoundError(f'Offline translation model not found: {model_path}')
+
+    command = _split_command_template(param_llama)
+    if not command:
+        raise ValueError('llama/param.txt is empty')
+
+    replacements = {
+        '$num_layers': str(gpu_layers or '0'),
+        '$port': str(port),
+    }
+    model_value = str(model_path)
+    for index, token in enumerate(command):
+        token = token.replace('llama/$model_file', model_value)
+        token = token.replace(r'llama\$model_file', model_value)
+        token = token.replace('$model_file', model_value)
+        for placeholder, replacement in replacements.items():
+            token = token.replace(placeholder, replacement)
+        command[index] = token
+
+    unresolved = [token for token in command if re.search(r'\$[A-Za-z_]+', token)]
+    if unresolved:
+        raise ValueError(f'Unresolved llama-server placeholders: {unresolved}')
+
+    executable = Path(command[0])
+    if not executable.is_absolute():
+        executable = Path.cwd() / executable
+    if os.name == 'nt' and not executable.is_file() and not executable.suffix:
+        executable = Path(str(executable) + '.exe')
+    if executable.is_file():
+        command[0] = str(executable.resolve())
+    elif shutil.which(command[0]) is None:
+        raise FileNotFoundError(f'llama-server executable not found: {command[0]}')
+
+    _set_command_option(command, ('--model', '-m'), '--model', model_value)
+    _set_command_option(command, ('--port',), '--port', str(port))
+    if str(gpu_layers).strip():
+        _set_command_option(
+            command, ('--n-gpu-layers', '-ngl'), '--n-gpu-layers',
+            str(gpu_layers).strip(),
+        )
+    return command
 
 
 @dataclass
@@ -148,7 +229,7 @@ class ConcurrentTranslationPool:
             proc = process_registry.popen(
                 [*_TRANSLATE_CMD, workspace, engine],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, encoding='utf-8', errors='replace', bufsize=1,
                 env=proc_env,
             )
 
@@ -598,8 +679,9 @@ class ConcurrentTranslationPool:
 
         port = 8989
 
-        args = [param.replace('$model_file', sakura_file).replace('$num_layers', sakura_mode).replace('$port', str(port))
-                for param in param_llama.split()]
+        args = build_llama_server_command(
+            sakura_file, sakura_mode, param_llama, port
+        )
 
         self._msg_queue.put("status", _("status_local_model_starting", port=port))
 
