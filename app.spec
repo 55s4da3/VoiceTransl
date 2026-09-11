@@ -14,7 +14,8 @@ def tool_data(name):
 
 
 app_datas = [
-    ('icon.png', '.'), ('avatar.png', '.'), ('llama', 'llama'),
+    ('icon.png', '.'), ('avatar.png', '.'), ('assets', 'assets'),
+    ('llama', 'llama'),
     ('crispasr', 'crispasr'), ('plugins', 'plugins'),
     ('ffmpeg', 'ffmpeg'), ('translation_guidelines', 'translation_guidelines'),
 ] + tool_data('separate') + tool_data('translate') + qt_material_datas
