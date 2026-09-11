@@ -1,0 +1,2 @@
+- 2026-09-06 23:37 | feat/qwen-streaming-integration | 未提交 12 个 | HEAD 2785f0f feat: add LAN translation service
+- 2026-09-06 23:39 | 分支 feat/qwen-streaming-integration | 未提交 12 个 | HEAD 2785f0f feat: add LAN translation service
