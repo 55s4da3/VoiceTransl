@@ -25,7 +25,11 @@ class QtResponsivenessTests(unittest.TestCase):
     def test_window_and_resegment_streaming_interlock(self):
         window = self._window()
         try:
-            self.assertEqual(window.top_tabs.count(), 6)
+            self.assertEqual(window.top_tabs.count(), 7)
+            self.assertEqual(
+                window.top_tabs.tabText(5), app._("tab_phone")
+            )
+            self.assertTrue(hasattr(window, "media_library_scan_button"))
             window.streaming_checkbox.setEnabled(True)
             window.streaming_checkbox.setChecked(True)
             window.ai_resegment_checkbox.setChecked(True)

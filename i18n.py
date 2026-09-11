@@ -9,6 +9,7 @@ TRANSLATIONS = {
         "lan_auto_start": "启动时自动开启",
         "lan_device_name": "电脑名称",
         "lan_port": "HTTP 端口",
+        "lan_allowed_networks": "额外允许的 VPN 网段（CIDR）",
         "lan_status_running": "状态：运行中",
         "lan_status_stopped": "状态：已停止",
         "lan_status_error": "局域网服务错误：{error}",
@@ -18,6 +19,7 @@ TRANSLATIONS = {
         "lan_rotate_code": "更换配对码",
         "lan_paired_devices": "已配对设备",
         "lan_revoke": "撤销授权",
+        "lan_file_management": "允许所选设备管理电脑文件（移动、改名、回收）",
         "lan_task_name": "手机任务：{filename}",
         # === Window & Tray ===
         "window_title": "VoiceTransl",
@@ -418,6 +420,7 @@ TRANSLATIONS = {
         "lan_auto_start": "Start automatically",
         "lan_device_name": "Computer name",
         "lan_port": "HTTP port",
+        "lan_allowed_networks": "Additional VPN networks (CIDR)",
         "lan_status_running": "Status: running",
         "lan_status_stopped": "Status: stopped",
         "lan_status_error": "LAN service error: {error}",
@@ -427,6 +430,7 @@ TRANSLATIONS = {
         "lan_rotate_code": "Rotate pairing code",
         "lan_paired_devices": "Paired devices",
         "lan_revoke": "Revoke",
+        "lan_file_management": "Allow the selected device to manage PC files (move, rename, trash)",
         "lan_task_name": "Phone task: {filename}",
         # === Window & Tray ===
         "window_title": "VoiceTransl",
@@ -829,6 +833,7 @@ TRANSLATIONS = {
         "lan_auto_start": "起動時に自動開始",
         "lan_device_name": "コンピューター名",
         "lan_port": "HTTP ポート",
+        "lan_allowed_networks": "追加で許可する VPN ネットワーク (CIDR)",
         "lan_status_running": "状態：実行中",
         "lan_status_stopped": "状態：停止",
         "lan_status_error": "LAN サービスエラー：{error}",
@@ -838,6 +843,7 @@ TRANSLATIONS = {
         "lan_rotate_code": "コードを更新",
         "lan_paired_devices": "ペアリング済み端末",
         "lan_revoke": "解除",
+        "lan_file_management": "選択した端末による PC ファイル管理（移動・名前変更・ごみ箱）を許可",
         "lan_task_name": "スマホタスク：{filename}",
         # === Window & Tray ===
         "window_title": "VoiceTransl",
@@ -1238,6 +1244,66 @@ TRANSLATIONS = {
 from qwen_ui_i18n import QWEN_UI_TRANSLATIONS
 
 for _language_code, _ui_strings in QWEN_UI_TRANSLATIONS.items():
+    TRANSLATIONS.setdefault(_language_code, {}).update(_ui_strings)
+
+_PHONE_UI_TRANSLATIONS = {
+    "zh": {
+        "tab_phone": "手机",
+        "media_library_title": "电脑作品库",
+        "media_library_root": "媒体目录",
+        "media_library_browse": "选择目录",
+        "media_library_scan": "立即扫描",
+        "media_library_auto_scan": "启动时自动扫描",
+        "media_library_status_empty": "尚未扫描电脑作品库",
+        "media_library_status_scanning": "正在后台扫描，源文件保持只读…",
+        "media_library_status_ready": "作品 {works} · 资源 {assets} · 音频 {audio} · 字幕 {subtitles} · 图片 {images} · 附件 {documents} · 特典 {bonus} · 未完成 {incomplete}",
+        "media_library_status_error": "作品库扫描失败：{error}",
+        "media_library_invalid_root": "媒体目录不存在或无法访问",
+        "media_library_scan_completed": "电脑作品库扫描完成",
+        "phone_queue_idle": "当前没有手机提交的任务",
+        "phone_queue_waiting": "等待电脑流水线",
+        "phone_queue_status": "当前手机任务：{active}；排队：{queued}",
+        "phone_sync_hint": "手机点击“从电脑同步”会获取这里的作品、章节和字幕信息；同步前必须完成配对。",
+    },
+    "en": {
+        "tab_phone": "Phone",
+        "media_library_title": "Computer media library",
+        "media_library_root": "Media folder",
+        "media_library_browse": "Browse",
+        "media_library_scan": "Scan now",
+        "media_library_auto_scan": "Scan automatically at startup",
+        "media_library_status_empty": "The computer media library has not been scanned",
+        "media_library_status_scanning": "Scanning in the background; source files remain read-only…",
+        "media_library_status_ready": "Works {works} · Assets {assets} · Audio {audio} · Subtitles {subtitles} · Images {images} · Attachments {documents} · Bonus {bonus} · Incomplete {incomplete}",
+        "media_library_status_error": "Media library scan failed: {error}",
+        "media_library_invalid_root": "The media folder does not exist or cannot be accessed",
+        "media_library_scan_completed": "Computer media library scan completed",
+        "phone_queue_idle": "No phone task is active",
+        "phone_queue_waiting": "Waiting for the computer pipeline",
+        "phone_queue_status": "Current phone task: {active}; queued: {queued}",
+        "phone_sync_hint": "Use “Sync from computer” on the phone to fetch works, chapters and subtitles. Pairing is required first.",
+    },
+    "ja": {
+        "tab_phone": "スマホ",
+        "media_library_title": "PC 作品ライブラリ",
+        "media_library_root": "メディアフォルダー",
+        "media_library_browse": "フォルダーを選択",
+        "media_library_scan": "今すぐスキャン",
+        "media_library_auto_scan": "起動時に自動スキャン",
+        "media_library_status_empty": "PC 作品ライブラリは未スキャンです",
+        "media_library_status_scanning": "バックグラウンドでスキャン中です。元ファイルは変更しません…",
+        "media_library_status_ready": "作品 {works} · リソース {assets} · 音声 {audio} · 字幕 {subtitles} · 画像 {images} · 添付 {documents} · 特典 {bonus} · 未完了 {incomplete}",
+        "media_library_status_error": "作品ライブラリのスキャンに失敗しました：{error}",
+        "media_library_invalid_root": "メディアフォルダーが存在しないか、アクセスできません",
+        "media_library_scan_completed": "PC 作品ライブラリのスキャンが完了しました",
+        "phone_queue_idle": "実行中のスマホタスクはありません",
+        "phone_queue_waiting": "PC パイプライン待機中",
+        "phone_queue_status": "現在のスマホタスク：{active}；待機：{queued}",
+        "phone_sync_hint": "スマホの「PC から同期」で作品・チャプター・字幕情報を取得します。先にペアリングしてください。",
+    },
+}
+
+for _language_code, _ui_strings in _PHONE_UI_TRANSLATIONS.items():
     TRANSLATIONS.setdefault(_language_code, {}).update(_ui_strings)
 
 

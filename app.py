@@ -29,6 +29,7 @@ from pool import ConcurrentTranslationPool
 from worker import MainWorker
 from tasking import CancellationToken, TaskSnapshot
 from lan_service import DEFAULT_HTTP_PORT, LanService, build_artifact
+from media_library import MediaLibraryDatabase, MediaLibraryScanner, write_preview
 from i18n import _, set_language, get_language
 from PySide6 import QtGui, QtCore
 from PySide6.QtCore import QThread, Signal, QTimer
@@ -215,6 +216,7 @@ class MainWindow(QMainWindow):
     config_write_status = Signal(str)
     lan_job_ready = Signal(str)
     lan_cancel_requested = Signal(str)
+    media_scan_finished = Signal(object, object)
 
     @staticmethod
     def default_output_dir() -> str:
@@ -237,6 +239,9 @@ class MainWindow(QMainWindow):
         self._suppress_auto_save = True
         self._config_write_lock = threading.Lock()
         self._config_write_generation = 0
+        self.media_library = MediaLibraryDatabase(
+            Path('project') / 'cache' / 'media_library.sqlite3'
+        )
         self.lan_service = None
         self._lan_profile_lock = threading.RLock()
         self._lan_profile_cache = {"public": {}, "snapshot": {}}
@@ -244,8 +249,10 @@ class MainWindow(QMainWindow):
         self._active_lan_job_id = None
         self._lan_task_outcomes = {}
         self._lan_shutdown_started = False
+        self._media_scan_thread = None
         self.lan_job_ready.connect(self._on_lan_job_ready)
         self.lan_cancel_requested.connect(self._on_lan_cancel_requested)
+        self.media_scan_finished.connect(self._on_media_scan_finished)
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
         self._auto_save_timer.setInterval(200)
@@ -263,6 +270,7 @@ class MainWindow(QMainWindow):
         self._log_level_filter = 'ALL'  # 日志级别过滤默认值
         self.setup_timer()
         self._initialize_lan_service()
+        self._initialize_media_library_ui()
 
     def _load_ui_language(self):
         """从 gui_settings.yaml 加载已保存的界面语言，在任何 _() 调用之前执行"""
@@ -409,6 +417,18 @@ class MainWindow(QMainWindow):
                 self.lan_device_name_edit.text().strip()
                 if hasattr(self, 'lan_device_name_edit') else 'VoiceTransl'
             ),
+            'lan_allowed_networks': (
+                self.lan_allowed_networks_edit.text().strip()
+                if hasattr(self, 'lan_allowed_networks_edit') else ''
+            ),
+            'media_library_root': (
+                self.media_library_root_edit.text().strip()
+                if hasattr(self, 'media_library_root_edit') else ''
+            ),
+            'media_library_auto_scan': bool(
+                self.media_library_auto_scan_checkbox.isChecked()
+                if hasattr(self, 'media_library_auto_scan_checkbox') else False
+            ),
         }
         file_contents = {
             'crispasr/param.txt': self.param_crispasr.toPlainText(),
@@ -524,6 +544,7 @@ class MainWindow(QMainWindow):
 
         self._enhance_workflow_page()
         self._build_config_page()
+        self._build_phone_page()
         self._build_dictionary_page()
         self._build_tools_page()
         self._enhance_task_page()
@@ -546,6 +567,7 @@ class MainWindow(QMainWindow):
         self.top_tabs.addTab(self.config_tab, _("tab_config"))
         self.top_tabs.addTab(self.dict_tab, _("tab_dict"))
         self.top_tabs.addTab(self.tools_tab, _("tab_tools"))
+        self.top_tabs.addTab(self.phone_tab, _("tab_phone"))
         self.top_tabs.addTab(self.log_tab, _("tab_tasks"))
         workspace_layout.addWidget(self.top_tabs, 1)
         workspace_layout.addWidget(self._make_shared_info_panel())
@@ -875,14 +897,59 @@ class MainWindow(QMainWindow):
         self._style_section(self.advanced_settings_tab, _("config_translation_title"))
         self.param_crispasr.setMaximumHeight(130)
         self.param_llama.setMaximumHeight(120)
-        self.lan_settings_section = self._build_lan_config_section()
-
         scroll, grid = self._scrollable_grid()
         grid.addWidget(self.settings_tab, 0, 0)
         grid.addWidget(self.advanced_settings_tab, 1, 0)
-        grid.addWidget(self.lan_settings_section, 2, 0)
         grid.setColumnStretch(0, 1)
-        grid.setRowStretch(3, 1)
+        grid.setRowStretch(2, 1)
+        layout.addWidget(scroll, 1)
+
+    def _build_phone_page(self):
+        self.phone_tab = Widget("Phone", self)
+        layout = self.phone_tab.vBoxLayout
+        layout.setContentsMargins(24, 18, 24, 20)
+        layout.setSpacing(10)
+
+        scroll, grid = self._scrollable_grid()
+        self.lan_settings_section = self._build_lan_config_section()
+        grid.addWidget(self.lan_settings_section, 0, 0)
+
+        library_section = Widget("PhoneMediaLibrary", self)
+        library_layout = library_section.vBoxLayout
+        library_layout.setContentsMargins(14, 12, 14, 14)
+        library_layout.setSpacing(8)
+        library_layout.addWidget(SubtitleLabel(_("media_library_title")))
+
+        library_grid = QGridLayout()
+        library_grid.setHorizontalSpacing(10)
+        library_grid.setVerticalSpacing(8)
+        library_grid.addWidget(BodyLabel(_("media_library_root")), 0, 0)
+        self.media_library_root_edit = QLineEdit()
+        self.media_library_root_edit.setPlaceholderText(r"D:\音声")
+        library_grid.addWidget(self.media_library_root_edit, 0, 1, 1, 4)
+        self.media_library_browse_button = QPushButton(_("media_library_browse"))
+        library_grid.addWidget(self.media_library_browse_button, 0, 5)
+
+        self.media_library_auto_scan_checkbox = QCheckBox(_("media_library_auto_scan"))
+        self.media_library_scan_button = QPushButton(_("media_library_scan"))
+        self.media_library_status_label = BodyLabel(_("media_library_status_empty"))
+        library_grid.addWidget(self.media_library_auto_scan_checkbox, 1, 0, 1, 2)
+        library_grid.addWidget(self.media_library_scan_button, 1, 2)
+        library_grid.addWidget(self.media_library_status_label, 1, 3, 1, 3)
+        library_grid.setColumnStretch(1, 1)
+        library_grid.setColumnStretch(4, 1)
+        library_layout.addLayout(library_grid)
+
+        self.phone_queue_label = BodyLabel(_("phone_queue_idle"))
+        self.phone_queue_label.setWordWrap(True)
+        library_layout.addWidget(self.phone_queue_label)
+        library_layout.addWidget(BodyLabel(_("phone_sync_hint")))
+
+        self.media_library_browse_button.clicked.connect(self._browse_media_library_root)
+        self.media_library_scan_button.clicked.connect(self._start_media_library_scan)
+        grid.addWidget(library_section, 1, 0)
+        grid.setColumnStretch(0, 1)
+        grid.setRowStretch(2, 1)
         layout.addWidget(scroll, 1)
 
     def _build_lan_config_section(self):
@@ -901,6 +968,8 @@ class MainWindow(QMainWindow):
         self.lan_port_spin.setRange(1024, 65535)
         self.lan_port_spin.setValue(DEFAULT_HTTP_PORT)
         self.lan_device_name_edit = QLineEdit(socket.gethostname() or "VoiceTransl")
+        self.lan_allowed_networks_edit = QLineEdit()
+        self.lan_allowed_networks_edit.setPlaceholderText("100.64.0.0/10, 10.0.0.0/8")
         grid.addWidget(self.lan_enabled_checkbox, 0, 0)
         grid.addWidget(self.lan_auto_start_checkbox, 0, 1)
         grid.addWidget(BodyLabel(_("lan_device_name")), 0, 2)
@@ -920,11 +989,15 @@ class MainWindow(QMainWindow):
         self.lan_devices_combo = QComboBox()
         self.lan_devices_combo.setMinimumWidth(180)
         self.lan_revoke_button = QPushButton(_("lan_revoke"))
+        self.lan_file_management_checkbox = QCheckBox(_("lan_file_management"))
         grid.addWidget(self.lan_start_button, 2, 0)
         grid.addWidget(self.lan_rotate_code_button, 2, 1)
         grid.addWidget(BodyLabel(_("lan_paired_devices")), 2, 2)
         grid.addWidget(self.lan_devices_combo, 2, 3, 1, 2)
         grid.addWidget(self.lan_revoke_button, 2, 5)
+        grid.addWidget(self.lan_file_management_checkbox, 3, 2, 1, 4)
+        grid.addWidget(BodyLabel(_("lan_allowed_networks")), 4, 0, 1, 2)
+        grid.addWidget(self.lan_allowed_networks_edit, 4, 2, 1, 4)
         grid.setColumnStretch(3, 1)
         layout.addLayout(grid)
 
@@ -932,6 +1005,8 @@ class MainWindow(QMainWindow):
         self.lan_start_button.clicked.connect(self._restart_lan_service)
         self.lan_rotate_code_button.clicked.connect(self._rotate_lan_pair_code)
         self.lan_revoke_button.clicked.connect(self._revoke_lan_device)
+        self.lan_devices_combo.currentIndexChanged.connect(self._refresh_lan_device_permission)
+        self.lan_file_management_checkbox.toggled.connect(self._set_lan_device_file_management)
         return section
 
     def _build_dictionary_page(self):
@@ -2242,6 +2317,17 @@ class MainWindow(QMainWindow):
                 self.lan_enabled_checkbox.setChecked(
                     bool(gui_settings.get('lan_enabled', False))
                 )
+                self.lan_allowed_networks_edit.setText(
+                    str(gui_settings.get('lan_allowed_networks', ''))
+                )
+            if hasattr(self, 'media_library_root_edit'):
+                default_media_root = r'D:\音声' if Path(r'D:\音声').is_dir() else ''
+                self.media_library_root_edit.setText(
+                    str(gui_settings.get('media_library_root', default_media_root))
+                )
+                self.media_library_auto_scan_checkbox.setChecked(
+                    bool(gui_settings.get('media_library_auto_scan', False))
+                )
 
         # API Key 始终从 .env 加载
         api_key = _load_api_key()
@@ -2377,7 +2463,100 @@ class MainWindow(QMainWindow):
             pass
         return sorted(addresses)
 
+    def _initialize_media_library_ui(self):
+        if not hasattr(self, 'media_library_root_edit'):
+            return
+        try:
+            status = self.media_library.status()
+            if not self.media_library_root_edit.text().strip() and status.get('root'):
+                self.media_library_root_edit.setText(str(status['root']))
+            self._refresh_media_library_status(status)
+        except Exception as error:
+            self.media_library_status_label.setText(
+                _("media_library_status_error", error=error)
+            )
+        if self.media_library_auto_scan_checkbox.isChecked():
+            QTimer.singleShot(500, self._start_media_library_scan)
+
+    def _browse_media_library_root(self):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            _("media_library_browse"),
+            self.media_library_root_edit.text().strip() or str(Path.cwd()),
+        )
+        if selected:
+            self.media_library_root_edit.setText(selected)
+            self._schedule_auto_save()
+
+    def _start_media_library_scan(self):
+        if self._media_scan_thread and self._media_scan_thread.is_alive():
+            return
+        root = Path(self.media_library_root_edit.text().strip()).expanduser()
+        if not root.is_dir():
+            self.media_library_status_label.setText(
+                _("media_library_status_error", error=_("media_library_invalid_root"))
+            )
+            return
+        self.media_library_scan_button.setEnabled(False)
+        self.media_library_status_label.setText(_("media_library_status_scanning"))
+        self._schedule_auto_save()
+
+        def run_scan():
+            try:
+                preview = MediaLibraryScanner(
+                    known_titles=self.media_library.title_aliases()
+                ).scan(root)
+                write_preview(
+                    preview,
+                    Path('project') / 'cache' / 'media_library_preview.json',
+                )
+                self.media_library.apply_preview(preview)
+                self.media_scan_finished.emit(self.media_library.status(), None)
+            except Exception as error:
+                self.media_scan_finished.emit(None, str(error))
+
+        self._media_scan_thread = threading.Thread(
+            target=run_scan,
+            name='media-library-scan',
+            daemon=True,
+        )
+        self._media_scan_thread.start()
+
+    def _on_media_scan_finished(self, status, error):
+        self._media_scan_thread = None
+        self.media_library_scan_button.setEnabled(True)
+        if error:
+            self.media_library_status_label.setText(
+                _("media_library_status_error", error=error)
+            )
+            return
+        self._refresh_media_library_status(status or {})
+        self._emit_status(_("media_library_scan_completed"))
+
+    def _refresh_media_library_status(self, status=None):
+        status = status or self.media_library.status()
+        works = int(status.get('works', 0) or 0)
+        if works <= 0:
+            self.media_library_status_label.setText(_("media_library_status_empty"))
+            return
+        self.media_library_status_label.setText(_(
+            "media_library_status_ready",
+            works=works,
+            assets=int(status.get('assets', 0) or 0),
+            audio=int(status.get('audio', 0) or 0),
+            subtitles=int(status.get('subtitles', 0) or 0),
+            images=int(status.get('images', 0) or 0),
+            documents=int(status.get('documents', 0) or 0),
+            bonus=int(status.get('bonus', 0) or 0),
+            incomplete=int(status.get('incomplete', 0) or 0),
+        ))
+
     def _new_lan_service(self):
+        allowed_networks = [
+            value.strip()
+            for value in re.split(r'[,;\s]+', self.lan_allowed_networks_edit.text())
+            if value.strip()
+        ]
         return LanService(
             root=Path('project') / 'cache' / 'lan_jobs',
             profile_provider=self._lan_profile_provider,
@@ -2386,6 +2565,8 @@ class MainWindow(QMainWindow):
             device_name=self.lan_device_name_edit.text().strip() or 'VoiceTransl',
             port=self.lan_port_spin.value(),
             state_dir=Path('project') / 'cache' / 'lan_state',
+            media_library=self.media_library,
+            allowed_networks=allowed_networks,
         )
 
     def _initialize_lan_service(self):
@@ -2460,6 +2641,29 @@ class MainWindow(QMainWindow):
             self.lan_service.revoke(str(device_id))
             self._refresh_lan_ui()
 
+    def _refresh_lan_device_permission(self, *_args):
+        if not hasattr(self, 'lan_file_management_checkbox'):
+            return
+        device_id = self.lan_devices_combo.currentData()
+        enabled = False
+        if self.lan_service and device_id:
+            enabled = self.lan_service.can_manage_files(str(device_id))
+        self.lan_file_management_checkbox.blockSignals(True)
+        self.lan_file_management_checkbox.setChecked(enabled)
+        self.lan_file_management_checkbox.setEnabled(bool(device_id))
+        self.lan_file_management_checkbox.blockSignals(False)
+
+    def _set_lan_device_file_management(self, enabled):
+        if not self.lan_service:
+            return
+        device_id = self.lan_devices_combo.currentData()
+        if not device_id:
+            return
+        try:
+            self.lan_service.set_file_management(str(device_id), bool(enabled))
+        except KeyError:
+            self._refresh_lan_ui()
+
     def _refresh_lan_ui(self):
         if not hasattr(self, 'lan_status_label'):
             return
@@ -2488,6 +2692,21 @@ class MainWindow(QMainWindow):
                 self.lan_devices_combo.setCurrentIndex(index)
         self.lan_devices_combo.blockSignals(False)
         self.lan_revoke_button.setEnabled(bool(devices))
+        self._refresh_lan_device_permission()
+        if hasattr(self, 'phone_queue_label'):
+            active_name = ''
+            if service and self._active_lan_job_id:
+                active_job = service.registry.public(self._active_lan_job_id) or {}
+                active_name = str(active_job.get('filename', '') or '')
+            queued = len(self._lan_job_queue)
+            if active_name or queued:
+                self.phone_queue_label.setText(_(
+                    "phone_queue_status",
+                    active=active_name or _("phone_queue_waiting"),
+                    queued=queued,
+                ))
+            else:
+                self.phone_queue_label.setText(_("phone_queue_idle"))
 
     def _on_lan_job_ready(self, job_id):
         if not self.lan_service:
