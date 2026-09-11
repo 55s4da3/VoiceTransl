@@ -20,6 +20,7 @@ if not _FROZEN:
         _STREAMING_PRELOAD_ERROR = _streaming_preload_exc
 import shutil
 import shlex
+from opencode_zen import OPENCODE_ZEN_ENDPOINT, OPENCODE_ZEN_PROVIDER
 
 NO_TRANSCRIPTION = '不进行听写'
 NO_TRANSLATION = '不进行翻译'
@@ -75,6 +76,7 @@ ONLINE_TRANSLATOR_MAPPING = {
     '阿里云': 'https://dashscope.aliyuncs.com/compatible-mode',
     'Gemini': 'https://generativelanguage.googleapis.com/v1beta/openai',
     'OpenAI': 'https://api.openai.com',
+    OPENCODE_ZEN_PROVIDER: OPENCODE_ZEN_ENDPOINT,
     'Ollama': 'http://localhost:11434',
     "llamacpp（通用本地模型）": "http://localhost:8989",
 }

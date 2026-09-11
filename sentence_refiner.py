@@ -13,6 +13,7 @@ from typing import Callable
 import httpx
 
 from GalTransl.ConfigHelper import build_httpx_sync_proxy_kwargs
+from opencode_zen import opencode_zen_api_mode
 from tasking import CancellationToken, TaskCancelledError
 
 
@@ -374,24 +375,38 @@ def request_openai_compatible(
     if not endpoint or not model or not api_key:
         raise RefinementError("AI 断句缺少 API 地址、模型名称或 Token")
     base_url = _openai_base_url(endpoint)
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "stream": True,
-        "max_tokens": max(1, min(
-            int(max_output_tokens),
-            384000 if model.lower().startswith("deepseek-v4") else 65536,
-        )),
-    }
+    api_mode = opencode_zen_api_mode(base_url, model)
+    if api_mode == "unsupported":
+        raise RefinementError(
+            f"OpenCode Zen 模型 {model} 使用 VoiceTransl 尚未支持的协议"
+        )
+    output_limit = max(1, min(
+        int(max_output_tokens),
+        384000 if model.lower().startswith("deepseek-v4") else 65536,
+    ))
+    if api_mode == "responses":
+        payload = {
+            "model": model,
+            "input": prompt,
+            "stream": True,
+            "max_output_tokens": output_limit,
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "stream": True,
+            "max_tokens": output_limit,
+        }
     model_lower = model.lower()
-    if model_lower.startswith("deepseek-v4"):
+    if api_mode == "chat" and model_lower.startswith("deepseek-v4"):
         payload["thinking"] = {
             "type": "enabled" if thinking_enabled else "disabled"
         }
-    elif "qwen3" in model_lower or "qwq" in model_lower:
+    elif api_mode == "chat" and ("qwen3" in model_lower or "qwq" in model_lower):
         payload["enable_thinking"] = bool(thinking_enabled)
-    elif re.search(
+    elif api_mode == "chat" and re.search(
         r"(^|[-_/:.])(?:r1|o1|o3|o4)(?:[-_/:.]|$)|reason",
         model_lower,
     ):
@@ -424,7 +439,7 @@ def request_openai_compatible(
         with httpx.Client(timeout=timeout, **client_kwargs) as client:
             with client.stream(
                 "POST",
-                base_url + "/chat/completions",
+                base_url + ("/responses" if api_mode == "responses" else "/chat/completions"),
                 headers=headers,
                 json=payload,
             ) as response:
@@ -438,8 +453,15 @@ def request_openai_compatible(
                         break
                     try:
                         event = json.loads(data)
-                        delta = event.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content")
+                        if api_mode == "responses":
+                            content = (
+                                event.get("delta")
+                                if event.get("type") == "response.output_text.delta"
+                                else None
+                            )
+                        else:
+                            delta = event.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content")
                         response_complete = False
                         if isinstance(content, str):
                             chunks.append(content)

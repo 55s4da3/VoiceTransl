@@ -25,6 +25,13 @@ import uuid
 from contextlib import suppress
 from GalTransl.TerminalOutput import should_print_translation_logs
 from output_metrics import encode_output_event
+from opencode_zen import (
+    opencode_zen_api_mode,
+    responses_finish_reason,
+    responses_output_text,
+    responses_stream_delta,
+    split_responses_messages,
+)
 
 
 _GLOBAL_RPM_LOCK = Lock()
@@ -693,6 +700,14 @@ class BaseTranslate:
                 {"role": "user", "content": prompt},
             ]
 
+        initial_model = self._request_model_name(token, model_override)
+        if opencode_zen_api_mode(token.domain, initial_model) == "unsupported":
+            raise ValueError(
+                f"OpenCode Zen 模型 {initial_model} 使用 VoiceTransl 尚未支持的协议；"
+                "请选择 GPT/Grok/Muse（Responses）或 DeepSeek/GLM/MiniMax/Kimi 等 "
+                "Chat Completions 模型。"
+            )
+
         if "gemini" in self._request_model_name(token, model_override):
             temperature = NOT_GIVEN
 
@@ -728,6 +743,7 @@ class BaseTranslate:
                 is_stream=stream if stream != NOT_GIVEN else token.stream
                 self._last_chatbot_was_stream = bool(is_stream)
                 request_model = self._request_model_name(token, model_override)
+                api_mode = opencode_zen_api_mode(token.domain, request_model)
                 self._last_chatbot_model_name = request_model
                 self._last_chatbot_finish_reason = None
                 LOGGER.debug(f"Call {token.domain} withs token {token.maskToken()}")
@@ -770,9 +786,32 @@ class BaseTranslate:
                             "high" if active_thinking_mode == "enabled" else "low"
                         )
 
-                api_task = asyncio.ensure_future(
-                    client.chat.completions.create(**request_kwargs)
-                )
+                if api_mode == "responses":
+                    instructions, response_input = split_responses_messages(messages)
+                    responses_kwargs = {
+                        "model": request_model,
+                        "input": response_input,
+                        "stream": is_stream,
+                        "timeout": self.api_timeout,
+                    }
+                    if instructions:
+                        responses_kwargs["instructions"] = instructions
+                    if max_tokens is not NOT_GIVEN:
+                        responses_kwargs["max_output_tokens"] = max_tokens
+                    requested_effort = reasoning_effort
+                    if requested_effort is NOT_GIVEN and active_thinking_mode != "auto":
+                        requested_effort = (
+                            "high" if active_thinking_mode == "enabled" else "low"
+                        )
+                    if requested_effort is not NOT_GIVEN:
+                        responses_kwargs["reasoning"] = {"effort": requested_effort}
+                    api_task = asyncio.ensure_future(
+                        client.responses.create(**responses_kwargs)
+                    )
+                else:
+                    api_task = asyncio.ensure_future(
+                        client.chat.completions.create(**request_kwargs)
+                    )
 
                 # Poll stop_event while waiting for the API response.
                 # This ensures that a stop request is detected within 0.5s
@@ -804,17 +843,27 @@ class BaseTranslate:
                                 stream_abort_requested = True
                                 from GalTransl.Service import JobCancelledError
                                 raise JobCancelledError()
-                            if not chunk.choices:
-                                continue
-                            if chunk.choices[0].finish_reason:
-                                stream_finish_reason = chunk.choices[0].finish_reason
-                            if hasattr(chunk.choices[0].delta, "reasoning_content"):
-                                reasoning_piece = (
-                                    chunk.choices[0].delta.reasoning_content or ""
+                            if api_mode == "responses":
+                                content_piece = responses_stream_delta(chunk)
+                                event_finish_reason = responses_finish_reason(chunk)
+                                if event_finish_reason:
+                                    stream_finish_reason = event_finish_reason
+                            else:
+                                if not chunk.choices:
+                                    continue
+                                if chunk.choices[0].finish_reason:
+                                    stream_finish_reason = chunk.choices[0].finish_reason
+                                if hasattr(chunk.choices[0].delta, "reasoning_content"):
+                                    reasoning_piece = (
+                                        chunk.choices[0].delta.reasoning_content or ""
+                                    )
+                                    lastline = lastline + reasoning_piece
+                                content_piece = (
+                                    chunk.choices[0].delta.content or ""
+                                    if hasattr(chunk.choices[0].delta, "content")
+                                    else ""
                                 )
-                                lastline = lastline + reasoning_piece
-                            if hasattr(chunk.choices[0].delta, "content"):
-                                content_piece = chunk.choices[0].delta.content or ""
+                            if content_piece:
                                 received_characters += len(content_piece)
                                 result = result + content_piece
                                 lastline = lastline + content_piece
@@ -869,14 +918,21 @@ class BaseTranslate:
                                 except Exception:
                                     pass
                 else:
-                    try:
-                        result = response.choices[0].message.content
-                        self._last_chatbot_finish_reason = response.choices[0].finish_reason
-                        received_characters = len(result or "")
-                    except:
-                        raise ValueError(
-                            "response.choices[0].message.content is None, no_candidates"
-                        )
+                    if api_mode == "responses":
+                        result = responses_output_text(response)
+                        if not result:
+                            raise ValueError("response.output_text is empty")
+                        self._last_chatbot_finish_reason = "stop"
+                        received_characters = len(result)
+                    else:
+                        try:
+                            result = response.choices[0].message.content
+                            self._last_chatbot_finish_reason = response.choices[0].finish_reason
+                            received_characters = len(result or "")
+                        except Exception:
+                            raise ValueError(
+                                "response.choices[0].message.content is None, no_candidates"
+                            )
                 emit_character_total(received_characters, final=True)
                 self._record_request_health(
                     time.monotonic() - request_started,

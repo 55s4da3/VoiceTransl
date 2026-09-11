@@ -2,6 +2,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from sentence_refiner import (
     RefinementError,
@@ -274,6 +275,51 @@ class SentenceRefinerTests(unittest.TestCase):
                 thinking_enabled=False,
             )
             self.assertFalse(seen["body"]["enable_thinking"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_streaming_opencode_responses_request(self):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["path"] = self.path
+                length = int(self.headers.get("content-length", "0"))
+                seen["body"] = json.loads(self.rfile.read(length))
+                payload = json.dumps({
+                    "type": "response.output_text.delta",
+                    "delta": '{"start_id":1,"end_id":1}\n',
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: " + payload + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "sentence_refiner.opencode_zen_api_mode",
+                return_value="responses",
+            ):
+                result = request_openai_compatible(
+                    "prompt",
+                    endpoint=f"http://127.0.0.1:{server.server_port}",
+                    model="gpt-5.6-sol",
+                    api_key="test-token",
+                    cancel_token=CancellationToken(),
+                )
+            self.assertIn('"end_id":1', result)
+            self.assertEqual(seen["path"], "/v1/responses")
+            self.assertEqual(seen["body"]["input"], "prompt")
+            self.assertEqual(seen["body"]["max_output_tokens"], 65536)
+            self.assertNotIn("messages", seen["body"])
         finally:
             server.shutdown()
             server.server_close()

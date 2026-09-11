@@ -38,6 +38,7 @@ from sentence_refiner import (
     resegment_request_limits,
     request_openai_compatible,
 )
+from opencode_zen import filter_supported_opencode_models
 from yt_dlp import YoutubeDL
 from bilibili_dl.bilibili_dl.Video import Video
 from bilibili_dl.bilibili_dl.downloader import download
@@ -635,6 +636,7 @@ class MainWorker(QObject):
                             if model_id and model_id not in seen_models:
                                 seen_models.add(model_id)
                                 models.append(model_id)
+                models = filter_supported_opencode_models(base_url, models)
                 if models:
                     total_models = len(models)
                     model_limit = 500

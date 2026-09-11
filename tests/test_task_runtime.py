@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import io
@@ -8,7 +9,7 @@ import time
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tasking import CancellationToken, ProcessRegistry, TaskCancelledError
 from tasking import TaskSnapshot
@@ -139,6 +140,70 @@ class TaskRuntimeTests(unittest.TestCase):
             BaseTranslate._request_model_name(token, 'deepseek-v4-pro'),
             'deepseek-v4-pro',
         )
+
+    def test_opencode_responses_stream_is_normalized_for_translation(self):
+        class FakeStream:
+            def __init__(self):
+                self.events = iter((
+                    SimpleNamespace(
+                        type="response.output_text.delta",
+                        delta="translated text",
+                    ),
+                    SimpleNamespace(type="response.completed"),
+                ))
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def aclose(self):
+                return None
+
+        responses_create = AsyncMock(return_value=FakeStream())
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(create=responses_create),
+        )
+        token = SimpleNamespace(
+            domain="https://opencode.ai/zen/v1",
+            model_name="gpt-5.6-sol",
+            stream=True,
+            maskToken=lambda: "test-token",
+        )
+        translator = BaseTranslate.__new__(BaseTranslate)
+        translator.client_list = [(fake_client, token)]
+        translator.proofread_client_list = []
+        translator.thinking_mode = "auto"
+        translator.proofread_thinking_mode = "auto"
+        translator.tokenStrategy = "random"
+        translator.api_timeout = 10
+        translator.apiErrorWait = 0
+        translator.global_request_rpm = 0
+        translator.request_health_metrics = SimpleNamespace(record=lambda *_args: None)
+        translator.pj_config = SimpleNamespace(
+            stop_event=threading.Event(),
+            active_workers=2,
+            bar=SimpleNamespace(text=lambda *_args: None),
+        )
+
+        result, used_token = asyncio.run(translator.ask_chatbot(
+            prompt="source",
+            system="translate",
+            stream=True,
+            max_tokens=2048,
+        ))
+
+        self.assertEqual(result, "translated text")
+        self.assertIs(used_token, token)
+        kwargs = responses_create.await_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["instructions"], "translate")
+        self.assertEqual(kwargs["input"], [{"role": "user", "content": "source"}])
+        self.assertEqual(kwargs["max_output_tokens"], 2048)
 
     def test_translation_config_writes_independent_proofread_profile(self):
         snapshot = TaskSnapshot('run', {

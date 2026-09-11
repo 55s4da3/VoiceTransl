@@ -13,6 +13,7 @@ from random import choice
 from asyncio import Queue
 from openai import OpenAI
 from GalTransl.TerminalOutput import should_print_translation_logs, terminal_progress
+from opencode_zen import opencode_zen_api_mode
 
 
 class COpenAIToken:
@@ -132,7 +133,15 @@ class COpenAITokenPool:
         st = time()
 
         try:
-            LOGGER.info(f"API URL: {token.domain}/chat/completions")
+            api_mode = opencode_zen_api_mode(token.domain, token.model_name)
+            if api_mode == "unsupported":
+                LOGGER.error(
+                    "OpenCode Zen model %s uses an unsupported protocol",
+                    token.model_name,
+                )
+                return False, token
+            api_path = "responses" if api_mode == "responses" else "chat/completions"
+            LOGGER.info(f"API URL: {token.domain}/{api_path}")
             proxy_kwargs = build_httpx_sync_proxy_kwargs(proxy.addr if proxy else None)
             client = OpenAI(
                 api_key=token.token,
@@ -141,6 +150,15 @@ class COpenAITokenPool:
             )
             # 可用性检测只关心"能否成功返回一个响应"，
             # 用极简 prompt + max_tokens=1 避免模型做无谓生成，大幅缩短检测耗时。
+            if api_mode == "responses":
+                response = client.responses.create(
+                    model=token.model_name,
+                    input="1+1=",
+                    timeout=self.timeout,
+                    stream=False,
+                    max_output_tokens=1,
+                )
+                return bool(getattr(response, "id", None)), token
             create_kwargs = dict(
                 model=token.model_name,
                 messages=[{"role": "user", "content": "1+1="}],
