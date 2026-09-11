@@ -3146,16 +3146,169 @@ class MainWindow(QMainWindow):
         body.addWidget(action_panel)
         self.about_layout.addLayout(body, 1)
 
+    @staticmethod
+    def _retranslate_combo(combo, translation_keys):
+        """Update translated labels without changing the selected item data."""
+        selected = combo.currentData()
+        combo.blockSignals(True)
+        try:
+            for index in range(combo.count()):
+                key = translation_keys.get(combo.itemData(index))
+                if key:
+                    combo.setItemText(index, _(key))
+            selected_index = combo.findData(selected)
+            if selected_index >= 0:
+                combo.setCurrentIndex(selected_index)
+        finally:
+            combo.blockSignals(False)
+
+    def _retranslate_ui(self):
+        """Refresh persistent interface strings after a language change."""
+        text_bindings = {
+            'about_title_label': 'about_title',
+            'start_button': 'about_start_btn',
+            'btn_wiki': 'about_wiki_btn',
+            'about_sponsor_title': 'about_sponsor_title',
+            'btn_afdian': 'about_afdian_btn',
+            'btn_bilibili': 'about_bilibili_btn',
+            'btn_kofi': 'about_kofi_btn',
+            'lang_selector_label': 'lang_selector_label',
+            'io_transcription_lang_label': 'io_transcription_lang_label',
+            'io_target_lang_label': 'io_target_lang_label',
+            'enable_transcription_checkbox': 'workflow_enable_transcription',
+            'enable_translation_checkbox': 'workflow_enable_translation',
+            'io_input_label': 'io_input_label',
+            'enable_segment_checkbox': 'io_segment_checkbox',
+            'io_segment_duration_label': 'io_segment_duration_label',
+            'streaming_checkbox': 'io_streaming_checkbox',
+            'ai_resegment_checkbox': 'io_ai_resegment_checkbox',
+            'proofread_checkbox': 'io_proofread_checkbox',
+            'io_proxy_label': 'io_proxy_label',
+            'io_output_dir_label': 'io_output_dir_label',
+            'output_dir_button': 'io_browse_dir_btn',
+            'use_input_dir_checkbox': 'io_use_input_dir_checkbox',
+            'auto_shutdown_checkbox': 'io_auto_shutdown_checkbox',
+            'io_format_label': 'io_output_content_label',
+            'io_container_label': 'io_output_container_label',
+            'run_button': 'io_run_btn',
+            'cancel_button': 'io_cancel_btn',
+            'open_output_button': 'io_open_output_btn',
+            'clean_button': 'io_clean_btn',
+            'dict_before_label': 'dict_before_label',
+            'dict_gpt_label': 'dict_gpt_label',
+            'dict_after_label': 'dict_after_label',
+            'dict_extra_label': 'dict_extra_label',
+            'dict_prompt_mode_label': 'dict_prompt_mode_label',
+            'settings_asr_provider_label': 'settings_asr_provider_label',
+            'settings_asr_engine_label': 'settings_asr_engine_label',
+            'settings_asr_model_label': 'settings_asr_model_label',
+            'settings_asr_device_label': 'settings_asr_device_label',
+            'settings_asr_compute_type_label': 'settings_asr_compute_type_label',
+            'settings_asr_extra_label': 'settings_asr_extra_label',
+            'settings_align_engine_label': 'settings_align_engine_label',
+            'settings_align_model_label': 'settings_align_model_label',
+            'settings_align_device_label': 'settings_align_device_label',
+            'settings_align_extra_label': 'settings_align_extra_label',
+            'settings_asr_backend_label': 'settings_crispasr_backend_label',
+            'settings_crispasr_model_label': 'settings_crispasr_model_label',
+            'settings_crispasr_aligner_label': 'settings_crispasr_aligner_label',
+            'settings_asr_param_label': 'settings_crispasr_param_label',
+            'open_crispasr_dir': 'settings_open_crispasr_btn',
+            'refresh_speech_models_button': 'settings_refresh_speech_btn',
+            'test_offline_asr_button': 'settings_test_offline_asr_btn',
+            'adv_translator_label': 'adv_translator_label',
+            'adv_concurrency_label': 'adv_concurrency_label',
+            'adv_online_token_label': 'adv_online_token_label',
+            'adv_online_model_label': 'adv_online_model_label',
+            'adv_auxiliary_models_label': 'adv_auxiliary_models_label',
+            'deepseek_thinking_checkbox': 'adv_deepseek_thinking',
+            'adv_online_address_label': 'adv_online_address_label',
+            'adv_offline_model_label': 'adv_offline_model_label',
+            'adv_offline_gpu_label': 'adv_offline_gpu_label',
+            'adv_offline_param_label': 'adv_offline_param_label',
+            'open_model_dir': 'adv_open_model_btn',
+            'refresh_language_models_button': 'adv_refresh_model_btn',
+            'test_offline_translation_button': 'adv_test_offline_btn',
+            'test_online_button': 'adv_test_api_btn',
+            'log_file_label': 'log_file_label',
+            'log_filter_label': 'log_filter_label',
+            'verbose_checkbox': 'log_verbose_checkbox',
+            'open_log_button': 'log_open_btn',
+            'clear_log_button': 'log_clear_btn',
+        }
+        for attribute, key in text_bindings.items():
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setText(_(key))
+
+        placeholder_bindings = {
+            'input_files_list': 'io_input_placeholder',
+            'proxy_address': 'io_proxy_placeholder',
+            'before_dict': 'dict_before_placeholder',
+            'gpt_dict': 'dict_gpt_placeholder',
+            'after_dict': 'dict_after_placeholder',
+            'extra_prompt': 'dict_extra_placeholder',
+            'settings_asr_extra_edit': 'settings_asr_extra_placeholder',
+            'settings_align_extra_edit': 'settings_align_extra_placeholder',
+            'param_crispasr': 'settings_crispasr_param_placeholder',
+            'gpt_token': 'adv_online_token_placeholder',
+            'gpt_model': 'adv_online_model_placeholder',
+            'gpt_address': 'adv_online_address_placeholder',
+            'param_llama': 'adv_offline_param_placeholder',
+        }
+        for attribute, key in placeholder_bindings.items():
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setPlaceholderText(_(key))
+
+        self._retranslate_combo(self.lang_selector, {
+            'zh': 'lang_zh', 'en': 'lang_en', 'ja': 'lang_ja',
+        })
+        language_keys = {
+            code: f"target_lang_{code.replace('-', '_')}"
+            for code in ('zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'ru', 'fr', 'zh')
+        }
+        self._retranslate_combo(self.transcription_lang, language_keys)
+        self._retranslate_combo(self.target_lang, language_keys)
+        self._retranslate_combo(self.output_content, {
+            '双语': 'output_content_bilingual', '目标': 'output_content_target',
+        })
+        self._retranslate_combo(self.output_container, {
+            'SRT': 'output_container_srt', 'LRC': 'output_container_lrc',
+        })
+        self._retranslate_combo(self.change_prompt_mode, {
+            '不修改': 'dict_prompt_mode_no', '追加': 'dict_prompt_mode_append',
+            '覆盖': 'dict_prompt_mode_overwrite',
+        })
+        self._retranslate_combo(self.translator_mode, {
+            'online': 'adv_translator_mode_online',
+            'local': 'adv_translator_mode_local',
+        })
+        self._retranslate_combo(self.asr_provider_combo, {
+            'crispasr': 'settings_asr_provider_crispasr',
+            'asrlabs': 'settings_asr_provider_asrlabs',
+        })
+        for index, key in enumerate((
+            'tab_about', 'tab_workflow', 'tab_config', 'tab_dict',
+            'tab_tools', 'tab_phone', 'tab_tasks',
+        )):
+            self.top_tabs.setTabText(index, _(key))
+        self.auxiliary_model_tabs.setTabText(
+            0, _("adv_ai_resegment_model_label")
+        )
+        self.auxiliary_model_tabs.setTabText(
+            1, _("adv_proofread_model_label")
+        )
+        self.setWindowTitle(_("window_title"))
+
     def _on_language_changed(self, index: int):
-        """界面语言变更：保存设置并提示重启后生效"""
+        """Apply a UI language change immediately without rebuilding the window."""
         if self._suppress_auto_save:
             return
-        lang_map = {0: "zh", 1: "en", 2: "ja"}
-        lang_code = lang_map.get(index, "zh")
+        lang_code = self.lang_selector.itemData(index) or "zh"
         set_language(lang_code)
-        # 触发防抖自动保存（save_config 会写入 ui_language）
+        self._retranslate_ui()
         self._schedule_auto_save()
-        # 通知用户：状态栏消息 + 托盘气泡
         lang_name = self.lang_selector.currentText() if hasattr(self, 'lang_selector') else lang_code
         self._emit_status(_("status_lang_changed", lang=lang_name))
         if getattr(self, 'tray_icon', None):
@@ -3183,9 +3336,9 @@ class MainWindow(QMainWindow):
         self.lang_selector_label = BodyLabel(_("lang_selector_label"))
         lang_layout.addWidget(self.lang_selector_label)
         self.lang_selector = QComboBox()
-        self.lang_selector.addItem(_("lang_zh"))
-        self.lang_selector.addItem(_("lang_en"))
-        self.lang_selector.addItem(_("lang_ja"))
+        self.lang_selector.addItem(_("lang_zh"), userData='zh')
+        self.lang_selector.addItem(_("lang_en"), userData='en')
+        self.lang_selector.addItem(_("lang_ja"), userData='ja')
         # Set current index based on saved/current language
         lang_map = {"zh": 0, "en": 1, "ja": 2}
         self.lang_selector.setCurrentIndex(lang_map.get(get_language(), 0))

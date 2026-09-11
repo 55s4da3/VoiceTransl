@@ -22,6 +22,21 @@ class QtResponsivenessTests(unittest.TestCase):
         window.save_config = lambda *args, **kwargs: None
         return window
 
+    def test_language_change_retranslates_visible_controls_immediately(self):
+        window = self._window()
+        try:
+            initial_text = window.run_button.text()
+            english_index = window.lang_selector.findData("en")
+            window.lang_selector.setCurrentIndex(english_index)
+            self.assertEqual(window.run_button.text(), app._("io_run_btn"))
+            self.assertEqual(window.top_tabs.tabText(5), app._("tab_phone"))
+            self.assertNotEqual(window.run_button.text(), initial_text)
+            self.assertEqual(window.lang_selector.currentData(), "en")
+        finally:
+            chinese_index = window.lang_selector.findData("zh")
+            window.lang_selector.setCurrentIndex(chinese_index)
+            window.close()
+
     def test_window_and_resegment_streaming_interlock(self):
         window = self._window()
         try:
