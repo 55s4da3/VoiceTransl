@@ -130,6 +130,31 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(proofread['model'], 'proofreader-v2')
         self.assertEqual(proofread['token'], 'proofread-key')
 
+    def test_official_deepseek_profiles_normalize_v41_aliases(self):
+        snapshot = TaskSnapshot('run', {
+            'translator': 'Deepseek',
+            'gpt_model': 'deepseek-v4.1-flash',
+            'gpt_token': 'main-key',
+            'ai_resegment_provider': 'follow',
+            'proofread_provider': 'Deepseek',
+            'proofread_model': 'deepseek-flash',
+            'proofread_token': 'proofread-key',
+        })
+        worker = MainWorker(
+            snapshot,
+            SimpleNamespace(put=lambda *_args: None),
+            CancellationToken(),
+        )
+
+        self.assertEqual(
+            worker._resolve_online_profile('ai_resegment')['model'],
+            'deepseek-v4-flash',
+        )
+        self.assertEqual(
+            worker._resolve_online_profile('proofread')['model'],
+            'deepseek-v4-flash',
+        )
+
     def test_proofread_model_can_override_translation_model(self):
         token = SimpleNamespace(model_name='deepseek-v4-flash')
         self.assertEqual(
@@ -252,6 +277,58 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(kwargs["model"], "deepseek-flash")
         self.assertEqual(
             kwargs["extra_body"]["thinking"], {"type": "enabled"}
+        )
+
+    def test_official_deepseek_v4_flash_uses_official_chat_contract(self):
+        chat_create = AsyncMock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="translated text"),
+                finish_reason="stop",
+            )],
+        ))
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=chat_create),
+            ),
+        )
+        token = SimpleNamespace(
+            domain="https://api.deepseek.com/v1",
+            model_name="deepseek-v4-flash",
+            stream=False,
+            maskToken=lambda: "test-token",
+        )
+        translator = BaseTranslate.__new__(BaseTranslate)
+        translator.client_list = [(fake_client, token)]
+        translator.proofread_client_list = []
+        translator.thinking_mode = "disabled"
+        translator.proofread_thinking_mode = "auto"
+        translator.tokenStrategy = "random"
+        translator.api_timeout = 10
+        translator.apiErrorWait = 0
+        translator.global_request_rpm = 0
+        translator.request_health_metrics = SimpleNamespace(
+            record=lambda *_args: None
+        )
+        translator.pj_config = SimpleNamespace(
+            stop_event=threading.Event(),
+            active_workers=2,
+            bar=SimpleNamespace(text=lambda *_args: None),
+        )
+
+        result, used_token = asyncio.run(translator.ask_chatbot(
+            prompt="source",
+            system="translate",
+            stream=False,
+            max_tokens=384000,
+        ))
+
+        self.assertEqual(result, "translated text")
+        self.assertIs(used_token, token)
+        kwargs = chat_create.await_args.kwargs
+        self.assertEqual(kwargs["model"], "deepseek-v4-flash")
+        self.assertEqual(kwargs["max_tokens"], 384000)
+        self.assertEqual(
+            kwargs["extra_body"]["thinking"], {"type": "disabled"}
         )
 
     def test_translation_config_writes_independent_proofread_profile(self):

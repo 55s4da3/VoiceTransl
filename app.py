@@ -7,10 +7,18 @@ import socket
 import threading
 import yaml
 from pathlib import Path
+from urllib.parse import urlparse
 
 import asrlabs_bridge
 import crispasr_bridge
-from opencode_zen import OPENCODE_GO_PROVIDER
+from opencode_zen import filter_supported_opencode_models
+from provider_presets import (
+    build_models_url_candidates,
+    normalize_provider_model,
+    provider_default_model,
+    provider_model_choices,
+    provider_preset,
+)
 
 from core import (
     DEFAULT_CRISPASR_BACKEND,
@@ -37,6 +45,12 @@ from i18n import _, set_language, get_language
 from PySide6 import QtGui, QtCore
 from PySide6.QtCore import QThread, Signal, QTimer
 from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtNetwork import (
+    QNetworkAccessManager,
+    QNetworkProxy,
+    QNetworkReply,
+    QNetworkRequest,
+)
 from PySide6.QtWidgets import (
     QApplication, QVBoxLayout, QFileDialog, QFrame, QSystemTrayIcon, QMenu,
     QHBoxLayout, QCheckBox, QDialog, QLabel, QWidget, QGridLayout,
@@ -253,6 +267,9 @@ class MainWindow(QMainWindow):
         self._lan_task_outcomes = {}
         self._lan_shutdown_started = False
         self._media_scan_thread = None
+        self._model_fetch_manager = None
+        self._model_fetch_reply = None
+        self._model_fetch_timer = None
         self.lan_job_ready.connect(self._on_lan_job_ready)
         self.lan_cancel_requested.connect(self._on_lan_cancel_requested)
         self.media_scan_finished.connect(self._on_media_scan_finished)
@@ -322,11 +339,25 @@ class MainWindow(QMainWindow):
         language = self.transcription_lang.currentData() or self.transcription_lang.currentText()
         gpt_token = self.gpt_token.text()
         gpt_address = self.gpt_address.text()
-        gpt_model = self.gpt_model.text()
+        gpt_model = normalize_provider_model(translator, self.gpt_model.text())
+        ai_resegment_provider = (
+            self.ai_resegment_provider_combo.currentData() or 'follow'
+        )
+        proofread_provider = (
+            self.proofread_provider_combo.currentData() or 'follow'
+        )
         ai_resegment_model = self._auxiliary_model_value(
             self.ai_resegment_model_combo
         )
         proofread_model = self._auxiliary_model_value(self.proofread_model_combo)
+        if ai_resegment_provider != 'follow':
+            ai_resegment_model = normalize_provider_model(
+                ai_resegment_provider, ai_resegment_model
+            )
+        if proofread_provider != 'follow':
+            proofread_model = normalize_provider_model(
+                proofread_provider, proofread_model
+            )
         api_tokens = {
             'VOICETRANSL_API_KEY': gpt_token,
             'VOICETRANSL_RESEGMENT_API_KEY': self.ai_resegment_token.text(),
@@ -371,10 +402,10 @@ class MainWindow(QMainWindow):
             'gpt_address': gpt_address,
             'gpt_model': gpt_model,
             'ai_resegment_model': ai_resegment_model,
-            'ai_resegment_provider': self.ai_resegment_provider_combo.currentData() or 'follow',
+            'ai_resegment_provider': ai_resegment_provider,
             'ai_resegment_address': self.ai_resegment_address.text().strip(),
             'proofread_model': proofread_model,
-            'proofread_provider': self.proofread_provider_combo.currentData() or 'follow',
+            'proofread_provider': proofread_provider,
             'proofread_address': self.proofread_address.text().strip(),
             'deepseek_thinking': self.deepseek_thinking_checkbox.isChecked(),
             'ai_resegment_thinking': self.ai_resegment_thinking_checkbox.isChecked(),
@@ -1543,9 +1574,12 @@ class MainWindow(QMainWindow):
             'target_lang': target_lang,
             'gpt_token': self.gpt_token.text() or _load_api_key(),
             'gpt_address': self.gpt_address.text(),
-            'gpt_model': self.gpt_model.text(),
-            'ai_resegment_model': self._auxiliary_model_value(
-                self.ai_resegment_model_combo
+            'gpt_model': normalize_provider_model(
+                self.translator_group.currentText(), self.gpt_model.text()
+            ),
+            'ai_resegment_model': normalize_provider_model(
+                self.ai_resegment_provider_combo.currentData() or 'follow',
+                self._auxiliary_model_value(self.ai_resegment_model_combo),
             ),
             'ai_resegment_provider': (
                 self.ai_resegment_provider_combo.currentData() or 'follow'
@@ -1555,8 +1589,9 @@ class MainWindow(QMainWindow):
                 self.ai_resegment_token.text()
                 or _load_api_key('VOICETRANSL_RESEGMENT_API_KEY')
             ),
-            'proofread_model': self._auxiliary_model_value(
-                self.proofread_model_combo
+            'proofread_model': normalize_provider_model(
+                self.proofread_provider_combo.currentData() or 'follow',
+                self._auxiliary_model_value(self.proofread_model_combo),
             ),
             'proofread_provider': (
                 self.proofread_provider_combo.currentData() or 'follow'
@@ -1992,12 +2027,7 @@ class MainWindow(QMainWindow):
         if previous_provider and previous_text:
             cache[previous_provider] = previous_text
 
-        if provider == 'Deepseek':
-            choices = ['deepseek-v4-flash', 'deepseek-v4-pro']
-        elif provider == OPENCODE_GO_PROVIDER:
-            choices = ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash']
-        else:
-            choices = []
+        choices = provider_model_choices(provider)
         choices.extend(
             self._auxiliary_discovered_models_for_provider(
                 model_combo, provider
@@ -2011,10 +2041,8 @@ class MainWindow(QMainWindow):
             model_combo.addItem(value, userData=value)
         if saved_value:
             model_combo.setEditText(saved_value)
-        elif provider == 'Deepseek':
-            model_combo.setCurrentText('deepseek-v4-flash')
-        elif provider == OPENCODE_GO_PROVIDER:
-            model_combo.setCurrentText('deepseek-flash')
+        elif provider_default_model(provider):
+            model_combo.setCurrentText(provider_default_model(provider))
         else:
             model_combo.setEditText('')
         model_combo.blockSignals(False)
@@ -2058,8 +2086,24 @@ class MainWindow(QMainWindow):
 
     def _on_main_translator_changed(self, _index=None):
         provider = self.translator_group.currentText()
-        if provider == OPENCODE_GO_PROVIDER and not self.gpt_model.text().strip():
-            self.gpt_model.setText('deepseek-flash')
+        previous_provider = getattr(self, '_main_model_provider', '')
+        current_model = self.gpt_model.text().strip()
+        if previous_provider and current_model:
+            self._main_model_cache[previous_provider] = normalize_provider_model(
+                previous_provider, current_model
+            )
+        if provider != previous_provider:
+            selected_model = self._main_model_cache.get(provider, '')
+            if not selected_model:
+                selected_model = provider_default_model(provider)
+            if selected_model:
+                self.gpt_model.setText(selected_model)
+        self._main_model_provider = provider
+        if hasattr(self, 'gpt_address'):
+            preset = provider_preset(provider)
+            self.gpt_address.setPlaceholderText(
+                preset.endpoint if preset else _("adv_online_address_placeholder")
+            )
         self._update_thinking_availability()
 
     def _update_translator_mode(self, _index=None, preferred: str = ''):
@@ -2110,6 +2154,11 @@ class MainWindow(QMainWindow):
         self._discovered_online_models = sorted(discovered)
 
     def cancel_task(self):
+        if self._model_fetch_reply is not None:
+            self._model_fetch_context['cancelled'] = True
+            self._emit_status(_("status_cancelling"))
+            self._model_fetch_reply.abort()
+            return
         if self.cancel_token and self.thread and self.thread.isRunning():
             self._emit_status(_("status_cancelling"))
             self.cancel_token.cancel()
@@ -3689,6 +3738,8 @@ class MainWindow(QMainWindow):
 
         self._discovered_online_models = []
         self._auxiliary_model_cache = {}
+        self._main_model_cache = {}
+        self._main_model_provider = self.translator_group.currentText()
 
         def make_auxiliary_profile():
             panel = QWidget()
@@ -4118,10 +4169,207 @@ class MainWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
+    def _finish_model_discovery(self, outcome: str):
+        timer = self._model_fetch_timer
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        manager = self._model_fetch_manager
+        if manager is not None:
+            manager.deleteLater()
+        self._model_fetch_timer = None
+        self._model_fetch_manager = None
+        self._model_fetch_reply = None
+        self._model_fetch_context = None
+        self._task_outcome = outcome
+        self._on_task_finished()
+
+    def _request_next_model_catalog_url(self):
+        context = self._model_fetch_context
+        if not context or not context['urls']:
+            error = (
+                context.get('last_error', 'no model endpoint')
+                if context else 'no model endpoint'
+            )
+            self._emit_status(_(
+                "status_api_error",
+                error=error,
+            ))
+            self._finish_model_discovery('error')
+            return
+        url = context['urls'].pop(0)
+        context['current_url'] = url
+        self._emit_status(_("status_api_testing", url=url))
+        request = QNetworkRequest(QtCore.QUrl(url))
+        request.setRawHeader(
+            b'Authorization', f"Bearer {context['token']}".encode('utf-8')
+        )
+        request.setRawHeader(b'Content-Type', b'application/json')
+        self._model_fetch_reply = self._model_fetch_manager.get(request)
+        self._model_fetch_timer.start(15000)
+
+    def _on_model_discovery_timeout(self):
+        context = self._model_fetch_context
+        reply = self._model_fetch_reply
+        if context is not None:
+            context['timed_out'] = True
+        if reply is not None:
+            reply.abort()
+
+    def _on_model_discovery_reply(self, reply: QNetworkReply):
+        if reply is not self._model_fetch_reply:
+            reply.deleteLater()
+            return
+        self._model_fetch_timer.stop()
+        context = self._model_fetch_context
+        self._model_fetch_reply = None
+        status_value = reply.attribute(
+            QNetworkRequest.Attribute.HttpStatusCodeAttribute
+        )
+        status = int(status_value) if status_value is not None else 0
+        raw_body = bytes(reply.readAll())
+        error_text = reply.errorString()
+        reply_error = reply.error()
+        reply.deleteLater()
+
+        if context['cancelled']:
+            self._emit_status(_("status_cancel_done"))
+            self._finish_model_discovery('cancelled')
+            return
+        if context['timed_out']:
+            self._emit_status(_(
+                "status_api_error",
+                error=f"15s timeout: {context['current_url']}",
+            ))
+            self._finish_model_discovery('error')
+            return
+        if status in {404, 405} and context['urls']:
+            context['last_error'] = f"HTTP {status}: {context['current_url']}"
+            self._request_next_model_catalog_url()
+            return
+        if (
+            reply_error != QNetworkReply.NetworkError.NoError
+            or not 200 <= status < 300
+        ):
+            detail = f"HTTP {status}: {error_text}" if status else error_text
+            self._emit_status(_("status_api_error", error=detail))
+            self._finish_model_discovery('error')
+            return
+
+        body = raw_body.decode('utf-8', errors='replace')
+        models = []
+        try:
+            payload = json.loads(body)
+            entries = payload.get('data', []) if isinstance(payload, dict) else []
+            seen = set()
+            for item in entries:
+                model_id = (
+                    str(item.get('id', '')).strip()
+                    if isinstance(item, dict) else ''
+                )
+                if model_id and model_id not in seen:
+                    seen.add(model_id)
+                    models.append(model_id)
+        except (TypeError, ValueError):
+            models = []
+
+        models = filter_supported_opencode_models(
+            context['current_url'], models
+        )
+        if models:
+            total_models = len(models)
+            if total_models > 500:
+                models = models[:500]
+                self._emit_status(_(
+                    "status_api_models_truncated", total=total_models, limit=500
+                ))
+            self._handle_model_list_loaded(models, context['target'])
+            self._emit_status(_("status_api_complete", count=len(models)))
+        else:
+            safe_body = body[:500].replace('\n', ' ')
+            token = context['token']
+            if token:
+                safe_body = safe_body.replace(token, '***')
+            self._emit_status(_(
+                "status_api_complete_body",
+                url=context['current_url'],
+                body=safe_body,
+            ))
+        self._finish_model_discovery('success')
+
+    def _start_model_discovery(
+        self,
+        *,
+        provider: str,
+        token: str,
+        address: str = '',
+        proxy_address: str = '',
+        target: str | None = None,
+    ):
+        if (
+            self._model_fetch_reply is not None
+            or (self.thread is not None and self.thread.isRunning())
+        ):
+            self._emit_status(_("status_task_busy"))
+            return
+        base_url = (
+            address.strip()
+            if 'custom' in provider.lower() and address.strip()
+            else ONLINE_TRANSLATOR_MAPPING.get(provider, '')
+        )
+        preset = provider_preset(provider)
+        urls = build_models_url_candidates(
+            base_url, preset.models_url if preset else ''
+        )
+        if not urls:
+            self._emit_status(_("status_api_select_model"))
+            return
+
+        self._set_progress_context(_("task_api_test"))
+        self._model_fetch_context = {
+            'urls': urls,
+            'current_url': '',
+            'last_error': '',
+            'token': token or _load_api_key(),
+            'target': target,
+            'timed_out': False,
+            'cancelled': False,
+        }
+        manager = QNetworkAccessManager(self)
+        proxy_value = str(proxy_address or '').strip()
+        if proxy_value:
+            parsed = urlparse(
+                proxy_value if '://' in proxy_value else f'http://{proxy_value}'
+            )
+            proxy_type = (
+                QNetworkProxy.ProxyType.Socks5Proxy
+                if parsed.scheme.lower().startswith('socks')
+                else QNetworkProxy.ProxyType.HttpProxy
+            )
+            proxy = QNetworkProxy(
+                proxy_type,
+                parsed.hostname or '',
+                parsed.port or 0,
+                parsed.username or '',
+                parsed.password or '',
+            )
+            manager.setProxy(proxy)
+        else:
+            manager.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
+        manager.finished.connect(self._on_model_discovery_reply)
+        self._model_fetch_manager = manager
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._on_model_discovery_timeout)
+        self._model_fetch_timer = timer
+        self._request_next_model_catalog_url()
+
     def run_test_online_api(self):
-        self._start_worker_task(
-            'test_online_api', _("task_api_test"),
-            show_model_dialog=True,
+        self._start_model_discovery(
+            provider=self.translator_group.currentText(),
+            token=self.gpt_token.text(),
+            address=self.gpt_address.text(),
+            proxy_address=self.proxy_address.text(),
         )
 
     def run_test_offline_asr(self):
@@ -4149,20 +4397,19 @@ class MainWindow(QMainWindow):
             target = 'proofread'
 
         provider = provider_combo.currentData() or 'follow'
-        overrides = {}
-        if provider != 'follow':
-            overrides = {
-                'translator': provider,
-                'gpt_model': self._auxiliary_model_value(model_combo),
-                'gpt_token': token_edit.text() or self.gpt_token.text(),
-                'gpt_address': address_edit.text().strip(),
-            }
-        self._start_worker_task(
-            'test_online_api',
-            _("task_api_test"),
-            show_model_dialog=True,
-            snapshot_overrides=overrides,
-            model_target=target,
+        if provider == 'follow':
+            provider = self.translator_group.currentText()
+            token = self.gpt_token.text()
+            address = self.gpt_address.text()
+        else:
+            token = token_edit.text() or self.gpt_token.text()
+            address = address_edit.text().strip()
+        self._start_model_discovery(
+            provider=provider,
+            token=token,
+            address=address,
+            proxy_address=self.proxy_address.text(),
+            target=target,
         )
     
     def cleaner(self):

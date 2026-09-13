@@ -1,7 +1,9 @@
 import os
+import json
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -83,6 +85,10 @@ class QtResponsivenessTests(unittest.TestCase):
             window.translator_group.setCurrentText('OpenCode Go')
             self.assertEqual(window.gpt_model.text(), 'deepseek-flash')
             self.assertTrue(window.deepseek_thinking_checkbox.isEnabled())
+            window.translator_group.setCurrentText('Deepseek')
+            self.assertEqual(window.gpt_model.text(), 'deepseek-v4-flash')
+            window.translator_group.setCurrentText('OpenCode Go')
+            self.assertEqual(window.gpt_model.text(), 'deepseek-flash')
             window.gpt_model.setText('deepseek-v4-flash')
             window._set_provider_value(
                 window.ai_resegment_provider_combo, 'OpenCode Go'
@@ -166,6 +172,71 @@ class QtResponsivenessTests(unittest.TestCase):
         finally:
             timer.stop()
             window.close()
+            self.qt_app.processEvents()
+
+    def test_model_discovery_uses_async_qt_network_without_blocking_ui(self):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen['path'] = self.path
+                seen['authorization'] = self.headers.get('Authorization')
+                # Keep the request open long enough to prove the Qt event loop
+                # continues ticking while model discovery is in flight.
+                time.sleep(0.12)
+                body = json.dumps({
+                    'data': [
+                        {'id': 'deepseek-v4-flash', 'owned_by': 'deepseek'},
+                        {'id': 'deepseek-v4-pro', 'owned_by': 'deepseek'},
+                    ]
+                }).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        window = self._window()
+        ticks = []
+        timer = QTimer()
+        timer.setInterval(20)
+        timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+        loop = QEventLoop()
+        poll = QTimer()
+        poll.setInterval(10)
+        poll.timeout.connect(
+            lambda: loop.quit() if window._model_fetch_reply is None else None
+        )
+        try:
+            timer.start()
+            poll.start()
+            QTimer.singleShot(3000, loop.quit)
+            window._start_model_discovery(
+                provider='custom',
+                token='test-key',
+                address=f'http://127.0.0.1:{server.server_port}',
+                target='resegment',
+            )
+            loop.exec()
+            self.assertIsNone(window._model_fetch_reply)
+            self.assertGreaterEqual(len(ticks), 2)
+            self.assertEqual(seen['path'], '/v1/models')
+            self.assertEqual(seen['authorization'], 'Bearer test-key')
+            self.assertGreaterEqual(
+                window.ai_resegment_model_combo.findData('deepseek-v4-flash'), 0
+            )
+        finally:
+            timer.stop()
+            poll.stop()
+            window.close()
+            server.shutdown()
+            server.server_close()
             self.qt_app.processEvents()
 
     def test_model_list_loading_does_not_open_hidden_modal_dialog(self):

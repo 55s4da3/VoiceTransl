@@ -20,13 +20,8 @@ if not _FROZEN:
         _STREAMING_PRELOAD_ERROR = _streaming_preload_exc
 import shutil
 import shlex
-from opencode_zen import (
-    OPENCODE_GO_ENDPOINT,
-    OPENCODE_GO_PROVIDER,
-    OPENCODE_ZEN_ENDPOINT,
-    OPENCODE_ZEN_PROVIDER,
-    is_deepseek_v4_family,
-)
+from opencode_zen import is_deepseek_v4_family
+from provider_presets import ONLINE_TRANSLATOR_MAPPING
 
 NO_TRANSCRIPTION = '不进行听写'
 NO_TRANSLATION = '不进行翻译'
@@ -68,25 +63,6 @@ def _compose_output_format(content, container, translation_enabled):
 
 def _format_command(command):
     return subprocess.list2cmdline(command) if os.name == 'nt' else shlex.join(command)
-
-
-ONLINE_TRANSLATOR_MAPPING = {
-    'Kimi': 'https://api.moonshot.cn',
-    'Kimi (国际)': 'https://api.moonshot.ai',
-    'GLM': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-    'GLM (国际)': 'https://api.z.ai/api/paas/v4/chat/completions',
-    'Deepseek': 'https://api.deepseek.com',
-    'Minimax': 'https://api.minimaxi.com',
-    'Minimax (国际)': 'https://api.minimaxi.io',
-    '豆包': 'https://ark.cn-beijing.volces.com/api',
-    '阿里云': 'https://dashscope.aliyuncs.com/compatible-mode',
-    'Gemini': 'https://generativelanguage.googleapis.com/v1beta/openai',
-    'OpenAI': 'https://api.openai.com',
-    OPENCODE_ZEN_PROVIDER: OPENCODE_ZEN_ENDPOINT,
-    OPENCODE_GO_PROVIDER: OPENCODE_GO_ENDPOINT,
-    'Ollama': 'http://localhost:11434',
-    "llamacpp（通用本地模型）": "http://localhost:8989",
-}
 
 
 def model_supports_thinking(model_name: str) -> bool:

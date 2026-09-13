@@ -48,6 +48,11 @@ from sentence_refiner import (
     request_openai_compatible,
 )
 from opencode_zen import filter_supported_opencode_models
+from provider_presets import (
+    build_models_url_candidates,
+    normalize_provider_model,
+    provider_preset,
+)
 from yt_dlp import YoutubeDL
 from bilibili_dl.bilibili_dl.Video import Video
 from bilibili_dl.bilibili_dl.downloader import download
@@ -314,7 +319,9 @@ class MainWorker(QObject):
             else ONLINE_TRANSLATOR_MAPPING.get(main_provider, '')
         )
         main_token = self.config.get('gpt_token', '') or _load_api_key()
-        main_model = self.config.get('gpt_model', '')
+        main_model = normalize_provider_model(
+            main_provider, self.config.get('gpt_model', '')
+        )
 
         provider = self.config.get(f'{prefix}_provider', 'follow') or 'follow'
         if provider == 'follow':
@@ -334,7 +341,10 @@ class MainWorker(QObject):
         return {
             'provider': provider,
             'endpoint': endpoint,
-            'model': self.config.get(f'{prefix}_model', '') or main_model,
+            'model': normalize_provider_model(
+                provider,
+                self.config.get(f'{prefix}_model', '') or main_model,
+            ),
             'token': self.config.get(f'{prefix}_token', '') or main_token,
             'follows_main': False,
         }
@@ -455,7 +465,9 @@ class MainWorker(QObject):
         language = self.config.get('language', 'ja')
         gpt_token = self.config.get('gpt_token', '') or _load_api_key()
         gpt_address = self.config.get('gpt_address', '')
-        gpt_model = self.config.get('gpt_model', '')
+        gpt_model = normalize_provider_model(
+            translator, self.config.get('gpt_model', '')
+        )
         proofread_profile = self._resolve_online_profile('proofread')
         proofread_model = proofread_profile['model'] or gpt_model
         sakura_file = self.config.get('sakura_file', '')
@@ -619,16 +631,17 @@ class MainWorker(QObject):
             self._emit_status(_("status_api_select_model"))
             return
 
-        base_url = re.sub(
-            r'/chat/completions$', '', base_url.rstrip('/'), flags=re.IGNORECASE
+        preset = provider_preset(translator)
+        model_urls = build_models_url_candidates(
+            base_url,
+            preset.models_url if preset else '',
         )
-        if re.search(r'/v\d+(?:beta)?(?:/openai)?$', base_url):
-            base_url += '/models'
-        else:
-            base_url += '/v1/models'
+        if not model_urls:
+            self._emit_status(_("status_api_select_model"))
+            return
 
         stage_id = self._begin_stage(_("progress_phase_api"))
-        self._emit_status(_("status_api_testing", url=base_url))
+        self._emit_status(_("status_api_testing", url=model_urls[0]))
         try:
             if proxy_address:
                 os.environ['HTTP_PROXY'] = proxy_address
@@ -643,12 +656,39 @@ class MainWorker(QObject):
             }
             client_kwargs = build_httpx_sync_proxy_kwargs(proxy_address or None)
             client_kwargs['trust_env'] = False
+            resp = None
+            last_error = None
             with httpx.Client(
-                timeout=httpx.Timeout(connect=3, read=2, write=3, pool=3),
+                timeout=httpx.Timeout(15.0),
                 **client_kwargs,
             ) as client:
-                resp = client.get(base_url, headers=headers)
-                resp.raise_for_status()
+                for index, model_url in enumerate(model_urls):
+                    if index:
+                        self._emit_status(_("status_api_testing", url=model_url))
+                    try:
+                        candidate = client.get(model_url, headers=headers)
+                        if (
+                            candidate.status_code in {404, 405}
+                            and index + 1 < len(model_urls)
+                        ):
+                            last_error = httpx.HTTPStatusError(
+                                f"HTTP {candidate.status_code}",
+                                request=candidate.request,
+                                response=candidate,
+                            )
+                            continue
+                        candidate.raise_for_status()
+                        resp = candidate
+                        base_url = model_url
+                        break
+                    except Exception as error:
+                        last_error = error
+                        if index + 1 >= len(model_urls):
+                            raise
+            if resp is None:
+                raise last_error or RuntimeError(
+                    "model discovery returned no response"
+                )
             self._raise_if_cancelled()
 
             models = []
